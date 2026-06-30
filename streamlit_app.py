@@ -3,9 +3,12 @@ from __future__ import annotations
 import io
 import math
 import os
+import random
+import re
 import tempfile
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any
 
 import gpxpy
 import imageio
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,25 +30,38 @@ from garminconnect import (
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 
-APP_TITLE = "Track Forge"
-APP_SUBTITLE = "GPX, FIT, and Garmin Connect to social-ready visuals"
-DEFAULT_OUTPUT_SIZE = (1080, 1350)
-DEFAULT_TRACK_COLOR = "#FC4C02"
+APP_TITLE = "GPS 2 Animation"
+APP_SUBTITLE = "GPX, FIT, TCX, and Garmin Connect to social-ready visuals"
+DEFAULT_OUTPUT_SIZE = (1024, 1024)
+DEFAULT_TRACK_COLOR = "#fc5200"
 DEFAULT_BACKGROUND = (0, 0, 0, 0)
 DEFAULT_FPS = 30
-DEFAULT_DURATION_SECONDS = 8
+DEFAULT_DURATION_SECONDS = 5
+DEFAULT_SPEED_MULTIPLIER = 3
+DEFAULT_STAT_FONT_SIZE = 30
 GARMIN_TOKEN_DIR = Path("data") / "garminconnect"
 
+CANVAS_OPTIONS = {
+    "Square 640x640": (640, 640),
+    "Square 1024x1024": (1024, 1024),
+    "Portrait 1080x1350": (1080, 1350),
+    "Wide 1920x1080": (1920, 1080),
+    "Story 1080x1920": (1080, 1920),
+}
+
+# (Key, Default Label, Default Unit, Default Decimals)
 STAT_DEFINITIONS = [
-    ("avg_speed", "Avg speed", "kph"),
-    ("elevation_gain", "Elevation gain", "m"),
-    ("moving_time", "Moving time", ""),
-    ("elapsed_time", "Elapsed time", ""),
-    ("avg_heart_rate", "Avg heart rate", "bpm"),
-    ("highest_point", "Highest point", "m"),
-    ("max_heart_rate", "Max heart rate", "bpm"),
-    ("avg_watts", "Avg watts", "W"),
-    ("calories", "kcal", "kcal"),
+    ("distance_m", "Distance", "km", 1),
+    ("moving_time", "Time", "", 0),
+    ("avg_speed", "Speed/Pace", "kph", 1), # Dynamically overridden
+    ("elevation_gain", "Elev Gain", "m", 0),
+    ("avg_heart_rate", "Avg HR", "bpm", 0),
+    ("avg_cadence", "Avg Cadence", "rpm", 0),
+    ("elapsed_time", "Elapsed time", "", 0),
+    ("highest_point", "Highest point", "m", 0),
+    ("max_heart_rate", "Max HR", "bpm", 0),
+    ("avg_watts", "Avg Power", "W", 0),
+    ("calories", "Calories", "kcal", 0),
 ]
 
 
@@ -53,8 +70,11 @@ class ActivityBundle:
     source: str
     title: str
     subtitle: str
+    date_str: str
+    activity_type: str
     dataframe: pd.DataFrame
-    stats: dict[str, Any]
+    fallback_stats: dict[str, Any]
+    stats: dict[str, Any] = None
 
 
 def set_page() -> None:
@@ -98,12 +118,8 @@ def safe_secrets_path(*keys: str) -> Any:
     return current
 
 
-def convert_utc_to_string(utc_seconds: float) -> str:
-    return datetime.fromtimestamp(utc_seconds, tz=timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
-
-
 def format_duration(seconds: float | int | None) -> str:
-    if seconds is None:
+    if seconds is None or pd.isna(seconds):
         return "-"
     seconds = int(round(float(seconds)))
     hours, remainder = divmod(max(seconds, 0), 3600)
@@ -113,16 +129,30 @@ def format_duration(seconds: float | int | None) -> str:
     return f"{minutes:d}:{secs:02d}"
 
 
-def format_value(value: Any, unit: str) -> str:
-    if value is None:
+def format_value(value: Any, unit: str, decimals: int = 0) -> str:
+    if value is None or pd.isna(value):
         return "-"
-    if isinstance(value, float) and math.isnan(value):
-        return "-"
+    val_f = float(value)
+    
+    if unit == "km":
+        return f"{val_f / 1000.0:.{decimals}f} km"
+        
+    if unit == "kph":
+        return f"{val_f:.{decimals}f} kph"
+        
+    if unit in {"/km", "min/km"}:
+        if val_f <= 0:
+            return "-"
+        pace_seconds = 3600.0 / val_f
+        return f"{format_duration(pace_seconds)}/km"
+            
     if unit == "":
         return format_duration(value)
-    if unit in {"m", "W", "bpm", "kcal"}:
-        return f"{int(round(float(value)))} {unit}".strip()
-    return f"{float(value):.1f} {unit}".strip()
+        
+    if unit in {"m", "W", "bpm", "kcal", "rpm"}:
+        return f"{val_f:.{decimals}f} {unit}".strip()
+        
+    return f"{val_f:.{decimals}f} {unit}".strip()
 
 
 def to_rgba(color: str, alpha: int = 255) -> tuple[int, int, int, int]:
@@ -143,20 +173,30 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def cumulative_distance(points: pd.DataFrame) -> pd.Series:
     if len(points) < 2:
         return pd.Series([0.0] * len(points), index=points.index, dtype=float)
-    distances = [0.0]
-    for idx in range(1, len(points)):
-        previous = points.iloc[idx - 1]
-        current = points.iloc[idx]
-        distances.append(
-            distances[-1]
-            + haversine_m(
-                float(previous["lat"]),
-                float(previous["lon"]),
-                float(current["lat"]),
-                float(current["lon"]),
+    try:
+        geometry = gpd.points_from_xy(points["lon"], points["lat"], crs="EPSG:4326")
+        gdf = gpd.GeoDataFrame(points[["lat", "lon"]].copy(), geometry=geometry, crs="EPSG:4326")
+        projected = gdf.to_crs(gdf.estimate_utm_crs())
+        xs = projected.geometry.x.to_numpy(dtype=float)
+        ys = projected.geometry.y.to_numpy(dtype=float)
+        segment_lengths = np.hypot(np.diff(xs), np.diff(ys))
+        distances = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+        return pd.Series(distances, index=points.index, dtype=float)
+    except Exception:
+        distances = [0.0]
+        for idx in range(1, len(points)):
+            previous = points.iloc[idx - 1]
+            current = points.iloc[idx]
+            distances.append(
+                distances[-1]
+                + haversine_m(
+                    float(previous["lat"]),
+                    float(previous["lon"]),
+                    float(current["lat"]),
+                    float(current["lon"]),
+                )
             )
-        )
-    return pd.Series(distances, index=points.index, dtype=float)
+        return pd.Series(distances, index=points.index, dtype=float)
 
 
 def normalize_activity_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -181,34 +221,34 @@ def normalize_activity_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def compute_stats(frame: pd.DataFrame, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+def compute_stats(frame: pd.DataFrame, fallback: dict[str, Any] | None = None, stopped_threshold_ms: float = 0.5) -> dict[str, Any]:
     fallback = fallback or {}
     stats: dict[str, Any] = {}
-    elapsed_time = None
-    moving_time = None
+    
+    elapsed_time = fallback.get("elapsed_time")
+    moving_time = fallback.get("moving_time")
 
-    if "time" in frame.columns and frame["time"].notna().any():
-        start = pd.to_datetime(frame["time"].iloc[0], utc=True, errors="coerce")
-        end = pd.to_datetime(frame["time"].iloc[-1], utc=True, errors="coerce")
-        if pd.notna(start) and pd.notna(end):
-            elapsed_time = float((end - start).total_seconds())
+    if "time" in frame.columns and frame["time"].notna().any() and "distance_m" in frame.columns:
+        time_diff = frame["time"].diff().dt.total_seconds().fillna(0)
+        dist_diff = frame["distance_m"].diff().fillna(0)
+        
+        speeds = np.divide(dist_diff, time_diff, out=np.zeros_like(dist_diff), where=time_diff!=0)
+        frame["speed_m_s"] = speeds
 
-    if elapsed_time is None and "time_s" in frame.columns and frame["time_s"].notna().any():
-        elapsed_time = float(frame["time_s"].dropna().iloc[-1] - frame["time_s"].dropna().iloc[0])
-
-    if elapsed_time is None and len(frame) > 1:
-        elapsed_time = float(len(frame) - 1)
-
-    moving_time = (
-        maybe_seconds(fallback.get("moving_time"))
-        or maybe_seconds(fallback.get("duration"))
-        or maybe_seconds(fallback.get("elapsed_time"))
-        or elapsed_time
-    )
+        if elapsed_time is None:
+            start = pd.to_datetime(frame["time"].iloc[0], utc=True, errors="coerce")
+            end = pd.to_datetime(frame["time"].iloc[-1], utc=True, errors="coerce")
+            if pd.notna(start) and pd.notna(end):
+                elapsed_time = float((end - start).total_seconds())
+                
+        # Re-calc moving time dynamically based on the threshold parameter
+        moving_mask = speeds > stopped_threshold_ms
+        moving_time = float(time_diff[moving_mask].sum())
 
     distance_m = float(frame["distance_m"].dropna().iloc[-1]) if frame["distance_m"].notna().any() else float(fallback.get("distance_m", 0.0) or 0.0)
     altitude = frame["altitude_m"].dropna() if "altitude_m" in frame.columns else pd.Series(dtype=float)
     heartrate = frame["heartrate"].dropna() if "heartrate" in frame.columns else pd.Series(dtype=float)
+    cadence = frame["cadence"].dropna() if "cadence" in frame.columns else pd.Series(dtype=float)
     watts = frame["watts"].dropna() if "watts" in frame.columns else pd.Series(dtype=float)
 
     elevation_gain = 0.0
@@ -220,38 +260,45 @@ def compute_stats(frame: pd.DataFrame, fallback: dict[str, Any] | None = None) -
     if moving_time and moving_time > 0:
         avg_speed_kph = (distance_m / 1000.0) / (moving_time / 3600.0)
 
-    stats["avg_speed"] = avg_speed_kph
-    stats["elevation_gain"] = fallback.get("elevation_gain", elevation_gain)
+    stats["avg_speed"] = avg_speed_kph if avg_speed_kph else fallback.get("avg_speed")
+    stats["elevation_gain"] = elevation_gain if elevation_gain > 0 else fallback.get("elevation_gain")
     stats["moving_time"] = moving_time
     stats["elapsed_time"] = elapsed_time
-    stats["avg_heart_rate"] = float(heartrate.mean()) if len(heartrate) else fallback.get("avg_heart_rate")
-    stats["highest_point"] = float(altitude.max()) if len(altitude) else fallback.get("highest_point")
-    stats["max_heart_rate"] = float(heartrate.max()) if len(heartrate) else fallback.get("max_heart_rate")
-    stats["avg_watts"] = float(watts.mean()) if len(watts) else fallback.get("avg_watts")
+    
+    stats["avg_heart_rate"] = fallback.get("avg_heart_rate") or (float(heartrate.mean()) if len(heartrate) else None)
+    stats["max_heart_rate"] = fallback.get("max_heart_rate") or (float(heartrate.max()) if len(heartrate) else None)
+    stats["avg_cadence"] = fallback.get("avg_cadence") or (float(cadence.mean()) if len(cadence) else None)
+    stats["avg_watts"] = fallback.get("avg_watts") or (float(watts.mean()) if len(watts) else None)
+    stats["highest_point"] = fallback.get("highest_point") or (float(altitude.max()) if len(altitude) else None)
+    
     stats["calories"] = fallback.get("calories")
     stats["distance_m"] = distance_m
+    
     return stats
 
 
-def maybe_seconds(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.timestamp()
-    if isinstance(value, (int, float)):
-        return float(value)
-    if hasattr(value, "timestamp"):
-        return float(value.timestamp())
-    return None
+def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    track_points = points.copy()
+    if track_points.empty or not config["privacy_filter_enabled"]:
+        return track_points
 
+    start_trim_m = config["privacy_start_trim_m"]
+    end_trim_m = config["privacy_end_trim_m"]
 
-def build_stat_table(stats: dict[str, Any], enabled_stats: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    rows: list[tuple[str, str]] = []
-    for row in sorted(enabled_stats, key=lambda item: (item["order"], item["label"])):
-        if not row["enabled"]:
-            continue
-        rows.append((row["label"], format_value(stats.get(row["key"]), row["unit"])))
-    return rows
+    if start_trim_m == 0 and end_trim_m == 0:
+        return track_points
+        
+    max_dist = float(track_points["distance_m"].iloc[-1])
+    
+    trimmed = track_points[
+        (track_points["distance_m"] >= start_trim_m) & 
+        (track_points["distance_m"] <= (max_dist - end_trim_m))
+    ]
+    
+    if trimmed.empty:
+        return track_points.iloc[:1].reset_index(drop=True)
+        
+    return trimmed.reset_index(drop=True)
 
 
 def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -342,17 +389,22 @@ def render_map_background(points: pd.DataFrame, size: tuple[int, int], style: st
     return crop
 
 
-def project_track(points: pd.DataFrame, size: tuple[int, int], padding: int = 70) -> np.ndarray:
+def project_track(points: pd.DataFrame, size: tuple[int, int], padding: tuple[int, int, int, int] = (44, 44, 44, 44)) -> np.ndarray:
     width, height = size
+    left_pad, top_pad, right_pad, bottom_pad = padding
     min_lon, max_lon = float(points["lon"].min()), float(points["lon"].max())
     min_lat, max_lat = float(points["lat"].min()), float(points["lat"].max())
     span_lon = max(max_lon - min_lon, 1e-9)
     span_lat = max(max_lat - min_lat, 1e-9)
-    usable_width = width - 2 * padding
-    usable_height = height - 2 * padding
+    usable_width = max(1, width - left_pad - right_pad)
+    usable_height = max(1, height - top_pad - bottom_pad)
     scale = min(usable_width / span_lon, usable_height / span_lat)
-    xs = padding + (points["lon"].to_numpy() - min_lon) * scale
-    ys = height - padding - (points["lat"].to_numpy() - min_lat) * scale
+    track_width = span_lon * scale
+    track_height = span_lat * scale
+    x_offset = left_pad + (usable_width - track_width) / 2.0
+    y_offset = top_pad + (usable_height - track_height) / 2.0
+    xs = x_offset + (points["lon"].to_numpy() - min_lon) * scale
+    ys = height - y_offset - (points["lat"].to_numpy() - min_lat) * scale
     return np.column_stack([xs, ys])
 
 
@@ -369,68 +421,28 @@ def resample_polyline(points_xy: np.ndarray, target_points: int = 800) -> np.nda
     return np.column_stack([x, y])
 
 
-def draw_text_box(image: Image.Image, lines: list[tuple[str, str]], color: str, position: tuple[int, int]) -> None:
-    draw = ImageDraw.Draw(image)
-    x, y = position
-    title_font = get_font(28)
-    value_font = get_font(24)
-    box_width = 320
-    line_height = 34
-    padding = 18
-    height = padding * 2 + len(lines) * line_height + 12
-    draw.rounded_rectangle((x, y, x + box_width, y + height), radius=22, fill=(11, 13, 16, 160), outline=(255, 255, 255, 35), width=1)
-    draw.text((x + padding, y + 10), "Session stats", fill=(250, 251, 252, 235), font=title_font)
-    offset_y = y + 52
-    accent = to_rgba(color)
-    for label, value in lines:
-        draw.text((x + padding, offset_y), label, fill=(226, 230, 235, 255), font=value_font)
-        draw.text((x + box_width - 18 - draw.textlength(value, font=value_font), offset_y), value, fill=accent, font=value_font)
-        offset_y += line_height
-
-
-def draw_footer(image: Image.Image, title: str, subtitle: str) -> None:
-    draw = ImageDraw.Draw(image)
-    title_font = get_font(48)
-    subtitle_font = get_font(26)
-    draw.text((56, 44), title, fill=(250, 251, 252, 255), font=title_font)
-    draw.text((58, 102), subtitle, fill=(255, 255, 255, 180), font=subtitle_font)
-
-
 def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, color: str, width: int = 9) -> None:
     draw = ImageDraw.Draw(image)
     limit = max(2, int(round((len(points_xy) - 1) * progress)))
     track = [tuple(point) for point in points_xy[:limit]]
     if len(track) > 1:
         draw.line(track, fill=to_rgba(color, 255), width=width, joint="curve")
-    marker = tuple(points_xy[min(limit - 1, len(points_xy) - 1)])
-    radius = 13
-    draw.ellipse((marker[0] - radius, marker[1] - radius, marker[0] + radius, marker[1] + radius), fill=(255, 255, 255, 235))
-    draw.ellipse((marker[0] - radius + 4, marker[1] - radius + 4, marker[0] + radius - 4, marker[1] + radius - 4), fill=to_rgba(color, 255))
 
 
-def render_frame(points: pd.DataFrame, stats_rows: list[tuple[str, str]], config: dict[str, Any], progress: float) -> Image.Image:
+def render_frame(points: pd.DataFrame, config: dict[str, Any], progress: float) -> Image.Image:
     size = config["output_size"]
     background_mode = config["background_mode"]
+    
     if background_mode == "transparent":
         base = Image.new("RGBA", size, DEFAULT_BACKGROUND)
-        if config["subtle_grid"]:
-            grid = Image.new("RGBA", size, (0, 0, 0, 0))
-            grid_draw = ImageDraw.Draw(grid)
-            grid_color = (255, 255, 255, 18)
-            step = 120
-            for x in range(0, size[0], step):
-                grid_draw.line((x, 0, x, size[1]), fill=grid_color, width=1)
-            for y in range(0, size[1], step):
-                grid_draw.line((0, y, size[0], y), fill=grid_color, width=1)
-            base = Image.alpha_composite(base, grid)
     else:
         base = render_map_background(points, size, background_mode)
-
-    points_xy = resample_polyline(project_track(points, size), target_points=max(400, int(config["fps"] * config["duration_seconds"] * 6)))
+        
+    points_xy = resample_polyline(
+        project_track(points, size),
+        target_points=len(points),
+    )
     draw_progress(base, points_xy, progress, config["track_color"], width=config["track_width"])
-    draw_footer(base, config["title"], config["subtitle"])
-    if config["show_stats"] and stats_rows:
-        draw_text_box(base, stats_rows, config["track_color"], position=(56, size[1] - 56 - (34 * len(stats_rows) + 58)))
     return base
 
 
@@ -445,14 +457,11 @@ def encode_gif(frames: list[Image.Image], fps: int) -> bytes:
             os.remove(temp_path)
 
 
-def encode_video(frames: list[Image.Image], fps: int, kind: str) -> bytes:
-    suffix = ".webm" if kind == "webm" else ".mp4"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+def encode_webm(frames: list[Image.Image], fps: int) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
         temp_path = temp_file.name
     try:
-        codec = "libvpx-vp9" if kind == "webm" else "libx264"
-        pix_fmt = "yuva420p" if kind == "webm" else "yuv420p"
-        with imageio.get_writer(temp_path, fps=fps, codec=codec, macro_block_size=None, ffmpeg_log_level="error", output_params=["-pix_fmt", pix_fmt]) as writer:
+        with imageio.get_writer(temp_path, fps=fps, codec="libvpx-vp9", macro_block_size=None, ffmpeg_log_level="error", output_params=["-pix_fmt", "yuva420p"]) as writer:
             for frame in frames:
                 writer.append_data(np.array(frame))
         return Path(temp_path).read_bytes()
@@ -461,41 +470,201 @@ def encode_video(frames: list[Image.Image], fps: int, kind: str) -> bytes:
             os.remove(temp_path)
 
 
-def render_bundle(points: pd.DataFrame, stats_rows: list[tuple[str, str]], config: dict[str, Any]) -> dict[str, Any]:
+def render_bundle(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]:
     effective_duration = config["duration_seconds"] / max(config["speed_multiplier"], 0.1)
     total_frames = max(12, int(round(config["fps"] * effective_duration)))
     progress_values = np.linspace(0.0, 1.0, total_frames)
-    frames = [render_frame(points, stats_rows, config, progress) for progress in progress_values]
+    track_points = trim_track_points(points, config)
+    
+    frames = [render_frame(track_points, config, progress) for progress in progress_values]
+    
+    pause_frames = int(round(config["fps"] * config.get("end_pause_seconds", 0)))
+    if pause_frames > 0 and frames:
+        frames.extend([frames[-1]] * pause_frames)
+
     return {
         "still": frames[-1],
         "frames": frames,
         "gif": encode_gif(frames, config["fps"]),
-        "webm": encode_video(frames, config["fps"], "webm"),
-        "mp4": encode_video(frames, config["fps"], "mp4"),
+        "webm": encode_webm(frames, config["fps"]),
     }
 
 
-def parse_gpx_bytes(data: bytes) -> pd.DataFrame:
+def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
+    """Renders the stats UI dynamically based on the enabled stats and custom decimals."""
+    width, height = 800, 360
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    font_size = config["stats_font_size"]
+    drop_shadow = config["stats_png_drop_shadow"]
+    
+    enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
+    
+    if not enabled_stats:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+        
+    num_stats = len(enabled_stats)
+    cols = 2
+    rows = math.ceil(num_stats / cols)
+    
+    value_font = get_font(font_size + 12)
+    label_font = get_font(max(12, font_size - 4))
+    
+    pad_x, pad_y = 20, 20
+    box_w = (width - pad_x * (cols + 1)) // cols
+    box_h = (height - pad_y * (rows + 1)) // rows
+    
+    for i, stat_row in enumerate(enabled_stats):
+        col = i % cols
+        r = i // cols
+        
+        x0 = pad_x + col * (box_w + pad_x)
+        
+        if i == num_stats - 1 and num_stats % 2 != 0:
+            x0 = (width - box_w) / 2
+            
+        y0 = pad_y + r * (box_h + pad_y)
+        
+        label = stat_row["label"]
+        raw_val = bundle.stats.get(stat_row["key"])
+        
+        # Apply the user's custom decimal choice when rendering!
+        value = format_value(raw_val, stat_row["unit"], stat_row.get("decimals", 0))
+            
+        _, _, lx, ly = draw.textbbox((0, 0), label, font=label_font)
+        label_x = x0 + (box_w - lx) / 2
+        label_y = y0 + box_h / 2 - ly - 5
+        
+        _, _, vx, vy = draw.textbbox((0, 0), value, font=value_font)
+        val_x = x0 + (box_w - vx) / 2
+        val_y = y0 + box_h / 2 + 5
+        
+        if drop_shadow:
+            shadow_offset = max(1, font_size // 15)
+            shadow_color = (0, 0, 0, 180)
+            draw.text((label_x + shadow_offset, label_y + shadow_offset), label, font=label_font, fill=shadow_color)
+            draw.text((val_x + shadow_offset, val_y + shadow_offset), value, font=value_font, fill=shadow_color)
+            
+        draw.text((label_x, label_y), label, font=label_font, fill=(255, 255, 255, 255))
+        draw.text((val_x, val_y), value, font=value_font, fill=(255, 255, 255, 255))
+        
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def parse_gpx_bytes(data: bytes) -> tuple[pd.DataFrame, str]:
     gpx = gpxpy.parse(data.decode("utf-8", errors="ignore"))
     rows: list[dict[str, Any]] = []
+    
+    activity_type = "unknown"
+    if gpx.tracks and gpx.tracks[0].type:
+        activity_type = gpx.tracks[0].type
+    
     for track in gpx.tracks:
         for segment in track.segments:
             for point in segment.points:
-                rows.append({"time": point.time, "lat": point.latitude, "lon": point.longitude, "altitude_m": point.elevation})
+                row = {
+                    "time": point.time, 
+                    "lat": point.latitude, 
+                    "lon": point.longitude, 
+                    "altitude_m": point.elevation
+                }
+                
+                # Extract extensions (e.g. Heart Rate, Cadence)
+                for ext in point.extensions:
+                    for child in ext:
+                        tag = child.tag.lower()
+                        if child.text is not None:
+                            try:
+                                if 'hr' in tag or 'heartrate' in tag:
+                                    row['heartrate'] = float(child.text)
+                                elif 'cad' in tag or 'cadence' in tag:
+                                    row['cadence'] = float(child.text)
+                                elif 'power' in tag or 'watts' in tag:
+                                    row['watts'] = float(child.text)
+                            except ValueError:
+                                pass
+                                
+                rows.append(row)
+                
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return frame
+        return frame, activity_type
     frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
-    return normalize_activity_frame(frame)
+    return normalize_activity_frame(frame), activity_type
 
 
-def parse_gpx_upload(uploaded_file: Any) -> pd.DataFrame:
-    return parse_gpx_bytes(uploaded_file.getvalue())
+def parse_tcx_bytes(data: bytes) -> tuple[pd.DataFrame, str]:
+    activity_type = "unknown"
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as e:
+        st.error(f"Failed to parse TCX: {e}")
+        return pd.DataFrame(), activity_type
+        
+    rows = []
+    ns = {
+        'tcx': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2',
+        'ext': 'http://www.garmin.com/xmlschemas/ActivityExtension/v2'
+    }
+    
+    activity_node = root.find('.//tcx:Activity', ns)
+    if activity_node is not None:
+        activity_type = activity_node.attrib.get('Sport', 'unknown')
+    
+    for trackpoint in root.findall('.//tcx:Trackpoint', ns):
+        row = {}
+        
+        time_el = trackpoint.find('tcx:Time', ns)
+        if time_el is not None: 
+            row['time'] = time_el.text
+            
+        pos = trackpoint.find('tcx:Position', ns)
+        if pos is not None:
+            lat = pos.find('tcx:LatitudeDegrees', ns)
+            lon = pos.find('tcx:LongitudeDegrees', ns)
+            if lat is not None: row['lat'] = float(lat.text)
+            if lon is not None: row['lon'] = float(lon.text)
+            
+        alt = trackpoint.find('tcx:AltitudeMeters', ns)
+        if alt is not None: row['altitude_m'] = float(alt.text)
+        
+        hr = trackpoint.find('tcx:HeartRateBpm/tcx:Value', ns)
+        if hr is not None: row['heartrate'] = float(hr.text)
+        
+        cad = trackpoint.find('tcx:Cadence', ns)
+        if cad is not None: row['cadence'] = float(cad.text)
+        
+        watts = trackpoint.find('.//ext:Watts', ns)
+        if watts is not None: row['watts'] = float(watts.text)
+        
+        if 'lat' in row and 'lon' in row:
+            rows.append(row)
+            
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame, activity_type
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    return normalize_activity_frame(frame), activity_type
 
 
-def parse_fit_bytes(data: bytes) -> pd.DataFrame:
+def parse_fit_bytes(data: bytes) -> tuple[pd.DataFrame, str]:
     fit_file = FitFile(io.BytesIO(data))
     fit_file.parse()
+    
+    activity_type = "unknown"
+    for msg in fit_file.get_messages("sport"):
+        sport = msg.get_value("sport")
+        sub_sport = msg.get_value("sub_sport")
+        if sport:
+            activity_type = str(sport)
+            if sub_sport: activity_type += f"_{sub_sport}"
+        break
+        
     rows: list[dict[str, Any]] = []
     for message in fit_file.get_messages("record"):
         row: dict[str, Any] = {}
@@ -513,26 +682,25 @@ def parse_fit_bytes(data: bytes) -> pd.DataFrame:
         if row.get("power") is not None:
             row["watts"] = float(row["power"])
         rows.append(row)
+        
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return frame
+        return frame, activity_type
     if "timestamp" in frame.columns:
         frame["time"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    return normalize_activity_frame(frame)
+    return normalize_activity_frame(frame), activity_type
 
 
-def parse_fit_upload(uploaded_file: Any) -> pd.DataFrame:
-    return parse_fit_bytes(uploaded_file.getvalue())
-
-
-def parse_uploaded_activity(uploaded_file: Any) -> pd.DataFrame:
+def parse_uploaded_activity(uploaded_file: Any) -> tuple[pd.DataFrame, str]:
     suffix = Path(uploaded_file.name).suffix.lower()
     if suffix == ".gpx":
-        return parse_gpx_upload(uploaded_file)
+        return parse_gpx_bytes(uploaded_file.getvalue())
+    if suffix == ".tcx":
+        return parse_tcx_bytes(uploaded_file.getvalue())
     if suffix == ".fit":
-        return parse_fit_upload(uploaded_file)
-    st.error("Only .gpx and .fit files are supported.")
-    return pd.DataFrame()
+        return parse_fit_bytes(uploaded_file.getvalue())
+    st.error("Only .gpx, .tcx, and .fit files are supported.")
+    return pd.DataFrame(), "unknown"
 
 
 def unpack_downloaded_activity(data: bytes) -> tuple[str, bytes]:
@@ -543,8 +711,11 @@ def unpack_downloaded_activity(data: bytes) -> tuple[str, bytes]:
                 if suffix in {".gpx", ".fit", ".tcx"}:
                     return suffix, archive.read(name)
     text = data.lstrip()
-    if text.startswith(b"<?xml") or b"<gpx" in text[:2000].lower():
-        return ".gpx", data
+    if text.startswith(b"<?xml"):
+        if b"<gpx" in text[:2000].lower():
+            return ".gpx", data
+        if b"<TrainingCenterDatabase" in text[:2000].lower():
+            return ".tcx", data
     return ".fit", data
 
 
@@ -560,17 +731,20 @@ def garmin_stats(activity: dict[str, Any]) -> dict[str, Any]:
         "elevation_gain": activity.get("elevationGain") or activity.get("totalElevationGain"),
         "avg_heart_rate": activity.get("averageHR") or activity.get("averageHeartRate"),
         "max_heart_rate": activity.get("maxHR") or activity.get("maxHeartRate"),
+        "avg_cadence": activity.get("averageRunningCadenceInStepsPerMinute") or activity.get("averageBikingCadenceInRevPerMinute"),
         "avg_watts": activity.get("averagePower") or activity.get("averageWatts"),
         "highest_point": activity.get("maxElevation") or activity.get("highestPoint"),
         "calories": activity.get("calories") or activity.get("totalKilocalories"),
     }
 
 
-def garmin_download_frame(client: Garmin, activity_id: str) -> pd.DataFrame:
+def garmin_download_frame(client: Garmin, activity_id: str) -> tuple[pd.DataFrame, str]:
     downloaded = client.download_activity(activity_id, dl_fmt=Garmin.ActivityDownloadFormat.GPX)
     suffix, payload = unpack_downloaded_activity(downloaded)
     if suffix == ".fit":
         return parse_fit_bytes(payload)
+    if suffix == ".tcx":
+        return parse_tcx_bytes(payload)
     return parse_gpx_bytes(payload)
 
 
@@ -667,55 +841,122 @@ def garmin_activity_bundle(client: Garmin, limit: int) -> ActivityBundle | None:
     activity = activity_map[selected_id]
 
     try:
-        frame = garmin_download_frame(client, selected_id)
+        frame, parsed_type = garmin_download_frame(client, selected_id)
     except Exception as exc:
         st.error(f"Garmin download failed for activity {selected_id}: {exc}")
         return None
+        
+    activity_type = activity.get("activityType", {}).get("typeKey", parsed_type)
 
-    stats = compute_stats(frame, fallback=garmin_stats(activity))
+    date_str = str(activity.get("startTimeLocal") or activity.get("startTimeGMT") or "Unknown")[:10]
+    title = activity.get("activityName") or activity.get("name") or "Garmin activity"
+    
     return ActivityBundle(
         source="garmin",
-        title=activity.get("activityName") or activity.get("name") or "Garmin activity",
-        subtitle=f"{activity.get('activityType', {}).get('typeKey') if isinstance(activity.get('activityType'), dict) else activity.get('activityType', 'Garmin')} · {str(activity.get('startTimeLocal') or activity.get('startTimeGMT') or '')[:19]}",
+        title=title,
+        subtitle=f"{activity_type} · {date_str}",
+        date_str=date_str,
+        activity_type=str(activity_type),
         dataframe=frame,
-        stats=stats,
+        fallback_stats=garmin_stats(activity),
     )
 
 
 def uploaded_bundle(uploaded_file: Any) -> ActivityBundle | None:
     if uploaded_file is None:
         return None
-    frame = parse_uploaded_activity(uploaded_file)
+    frame, activity_type = parse_uploaded_activity(uploaded_file)
     if frame.empty or not {"lat", "lon"}.issubset(frame.columns):
         st.error("The uploaded file did not contain enough GPS data to render a route.")
         return None
-    stats = compute_stats(frame)
+        
     title = Path(uploaded_file.name).stem.replace("_", " ").replace("-", " ").title()
     subtitle = f"Uploaded {Path(uploaded_file.name).suffix.upper().lstrip('.')}"
-    return ActivityBundle(source="upload", title=title, subtitle=subtitle, dataframe=frame, stats=stats)
+    
+    date_str = "UnknownDate"
+    if "time" in frame.columns and not frame["time"].empty:
+        date_obj = pd.to_datetime(frame["time"].iloc[0])
+        if pd.notna(date_obj):
+            date_str = date_obj.strftime("%Y-%m-%d")
+
+    return ActivityBundle(
+        source="upload", 
+        title=title, 
+        subtitle=subtitle, 
+        date_str=date_str,
+        activity_type=str(activity_type),
+        dataframe=frame, 
+        fallback_stats={}
+    )
 
 
-def stat_editor_defaults(stats: dict[str, Any]) -> pd.DataFrame:
+def stat_editor_defaults(stats: dict[str, Any], activity_type: str) -> pd.DataFrame:
     rows = []
-    for order, (key, label, unit) in enumerate(STAT_DEFINITIONS, start=1):
-        rows.append({"key": key, "label": label, "unit": unit, "enabled": key in {"avg_speed", "elevation_gain", "moving_time"}, "order": order, "value": stats.get(key)})
+    
+    is_cycling = any(kw in activity_type.lower() for kw in ["cycl", "bik", "gravel"])
+    
+    default_keys = ["distance_m", "moving_time", "avg_speed", "elevation_gain"]
+    if stats.get("avg_heart_rate"): default_keys.append("avg_heart_rate")
+    
+    for order, (key, label, unit, decimals) in enumerate(STAT_DEFINITIONS, start=1):
+        # Override Speed vs Pace automatically based on activity type
+        if key == "avg_speed":
+            if is_cycling:
+                label = "Speed"
+                unit = "kph"
+            else:
+                label = "Pace"
+                unit = "/km"
+                decimals = 0 # Min/sec layout doesn't use decimals
+
+        formatted_val = format_value(stats.get(key), unit, decimals)
+        rows.append({
+            "key": key, 
+            "label": label, 
+            "unit": unit, 
+            "decimals": decimals,
+            "enabled": key in default_keys, 
+            "order": order, 
+            "value": formatted_val
+        })
     return pd.DataFrame(rows)
 
 
 def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
+    if "default_start_trim" not in st.session_state:
+        st.session_state.default_start_trim = random.randint(100, 750)
+        st.session_state.default_end_trim = random.randint(100, 750)
+
     st.sidebar.markdown("### Render settings")
-    output_size_name = st.sidebar.selectbox("Canvas size", ["Portrait 1080x1350", "Square 1080x1080", "Story 1080x1920"], index=0)
-    size_lookup = {"Portrait 1080x1350": (1080, 1350), "Square 1080x1080": (1080, 1080), "Story 1080x1920": (1080, 1920)}
+    output_size_name = st.sidebar.selectbox("Canvas size", list(CANVAS_OPTIONS.keys()), index=1)
+    size_lookup = CANVAS_OPTIONS
     background_mode = st.sidebar.selectbox("Background", ["transparent", "bw"], format_func=lambda value: "Transparent" if value == "transparent" else "Black & white map", index=0)
     color = st.sidebar.color_picker("Track color", value=DEFAULT_TRACK_COLOR)
-    track_width = st.sidebar.slider("Track width", min_value=3, max_value=18, value=9, step=1)
-    fps = st.sidebar.slider("Animation FPS", min_value=12, max_value=60, value=DEFAULT_FPS, step=3)
-    duration_seconds = st.sidebar.slider("Total duration (seconds)", min_value=2, max_value=30, value=DEFAULT_DURATION_SECONDS, step=1)
-    speed_multiplier = st.sidebar.slider("Animation speed", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
-    subtle_grid = st.sidebar.toggle("Add subtle grid to transparent exports", value=True)
-    show_stats = st.sidebar.toggle("Show stats", value=True)
+    track_width = st.sidebar.number_input("Track width", min_value=1, max_value=40, value=9, step=1)
+    fps = st.sidebar.number_input("Animation FPS", min_value=1, max_value=60, value=DEFAULT_FPS, step=1)
+    duration_seconds = st.sidebar.number_input("Total duration (seconds)", min_value=1, max_value=60, value=DEFAULT_DURATION_SECONDS, step=1)
+    speed_multiplier = st.sidebar.number_input("Animation speed", min_value=1, max_value=6, value=DEFAULT_SPEED_MULTIPLIER, step=1)
+    end_pause_seconds = st.sidebar.number_input("Pause on last frame (seconds)", min_value=0, max_value=10, value=4, step=1)
+    
+    st.sidebar.markdown("### Data Analytics")
+    stopped_threshold_ms = st.sidebar.slider("Stopped speed threshold (m/s)", 0.0, 3.0, 1.1, 0.1, help="Speeds below this threshold will not be counted in moving time.")
+    st.sidebar.markdown(f"Speed below {stopped_threshold_ms * 3.6:.1f} kph is considered stopped.")
+    # Dynamically re-calculate stats using the user's stopped threshold
+    bundle.stats = compute_stats(bundle.dataframe, fallback=bundle.fallback_stats, stopped_threshold_ms=stopped_threshold_ms)
+    
+    st.sidebar.markdown("### Stat Overlay Settings")
+    stats_font_size = st.sidebar.number_input("Stats font size", min_value=8, max_value=64, value=DEFAULT_STAT_FONT_SIZE, step=1)
+    stats_png_drop_shadow = st.sidebar.toggle("Stats PNG Drop Shadow", value=True)
+    show_stats = st.sidebar.toggle("Show stats in UI", value=True)
+    
+    st.sidebar.markdown("### Privacy Settings")
+    privacy_filter_enabled = st.sidebar.toggle("Privacy filter", value=False)
+    privacy_start_trim_m = st.sidebar.slider("Trim from start (meters)", min_value=0, max_value=5000, value=st.session_state.default_start_trim, step=50)
+    privacy_end_trim_m = st.sidebar.slider("Trim from end (meters)", min_value=0, max_value=5000, value=st.session_state.default_end_trim, step=50)
+    
+    # Initialize the data editor layout with auto-detected Pace/Speed labels based on type
     stats_df = st.sidebar.data_editor(
-        stat_editor_defaults(bundle.stats),
+        stat_editor_defaults(bundle.stats, bundle.activity_type),
         hide_index=True,
         width="stretch",
         num_rows="fixed",
@@ -724,14 +965,16 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
             "key": st.column_config.TextColumn("Key", disabled=True),
             "label": st.column_config.TextColumn("Label"),
             "unit": st.column_config.TextColumn("Unit", disabled=True),
+            "decimals": st.column_config.NumberColumn("Decimals", min_value=0, max_value=3, step=1),
             "enabled": st.column_config.CheckboxColumn("On"),
             "order": st.column_config.NumberColumn("Order", min_value=1, step=1),
             "value": st.column_config.TextColumn("Preview value", disabled=True),
         },
     )
+    
     stats_rows = [row.to_dict() for _, row in stats_df.iterrows()]
-    title = st.sidebar.text_input("Title", value=bundle.title)
-    subtitle = st.sidebar.text_input("Subtitle", value=bundle.subtitle)
+    stats_rows = sorted(stats_rows, key=lambda x: x.get('order', 99))
+    
     return {
         "output_size": size_lookup[output_size_name],
         "background_mode": background_mode,
@@ -740,57 +983,188 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
         "fps": fps,
         "duration_seconds": duration_seconds,
         "speed_multiplier": speed_multiplier,
-        "subtle_grid": subtle_grid,
+        "end_pause_seconds": end_pause_seconds,
+        "stats_font_size": stats_font_size,
+        "stats_png_drop_shadow": stats_png_drop_shadow,
         "show_stats": show_stats,
+        "privacy_filter_enabled": privacy_filter_enabled,
+        "privacy_start_trim_m": privacy_start_trim_m,
+        "privacy_end_trim_m": privacy_end_trim_m,
         "stats_rows": stats_rows,
-        "title": title,
-        "subtitle": subtitle,
     }
 
 
-def bundle_overview(bundle: ActivityBundle) -> None:
-    st.subheader(bundle.title)
-    st.caption(bundle.subtitle)
-    cols = st.columns(4)
-    stat_cards = [
-        ("Distance", format_value(bundle.stats.get("distance_m", 0.0) / 1000.0 if bundle.stats.get("distance_m") is not None else None, "km")),
-        ("Avg speed", format_value(bundle.stats.get("avg_speed"), "kph")),
-        ("Moving time", format_value(bundle.stats.get("moving_time"), "")),
-        ("Elevation gain", format_value(bundle.stats.get("elevation_gain"), "m")),
-    ]
-    for column, (label, value) in zip(cols, stat_cards, strict=False):
-        column.metric(label, value)
+def bundle_overview(bundle: ActivityBundle, config: dict[str, Any]) -> None:
+    if not config["show_stats"]:
+        return
+        
+    enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
+    
+    st.markdown("<div style='text-align:center; font-size:1.1rem; font-weight:700; letter-spacing:0.02em; margin: 0.25rem 0 0.85rem;'>Stats</div>", unsafe_allow_html=True)
+    
+    cols = st.columns(2)
+    label_font_size = max(10, config["stats_font_size"] - 8)
+    card_html = """
+    <div style="padding: 1rem 1.1rem; border-radius: 18px; border: 1px solid rgba(255,255,255,0.08); background: rgba(13,17,22,0.72); box-shadow: 0 14px 34px rgba(0,0,0,0.18); text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height: 112px; margin-bottom: 1rem;">
+      <div style="font-size: {label_font_size}px; line-height: 1.1; letter-spacing: 0.02em; color: rgba(245,247,250,0.72); margin-bottom: 0.45rem;">{label}</div>
+      <div style="font-size: {value_font_size}px; line-height: 1.05; font-weight: 700; color: #f5f7fa;">{value}</div>
+    </div>
+    """
+    
+    num_stats = len(enabled_stats)
+    for i, stat_row in enumerate(enabled_stats):
+        col_idx = i % 2
+        
+        # Center the final item if odd by putting it in a container that spans cols
+        if i == num_stats - 1 and num_stats % 2 != 0:
+            with st.container():
+                st.markdown(
+                    card_html.format(
+                        label=stat_row["label"], 
+                        value=format_value(bundle.stats.get(stat_row["key"]), stat_row["unit"], stat_row.get("decimals", 0)), 
+                        label_font_size=label_font_size, 
+                        value_font_size=config["stats_font_size"]
+                    ),
+                    unsafe_allow_html=True,
+                )
+        else:
+            with cols[col_idx]:
+                st.markdown(
+                    card_html.format(
+                        label=stat_row["label"], 
+                        value=format_value(bundle.stats.get(stat_row["key"]), stat_row["unit"], stat_row.get("decimals", 0)), 
+                        label_font_size=label_font_size, 
+                        value_font_size=config["stats_font_size"]
+                    ),
+                    unsafe_allow_html=True,
+                )
+                
     with st.expander("All computed stats", expanded=False):
         st.dataframe(pd.DataFrame([{ "metric": key, "value": value } for key, value in bundle.stats.items()]), width="stretch", hide_index=True)
 
+        # Percentiles and Histogram additions
+        is_cycling = any(kw in bundle.activity_type.lower() for kw in ["cycl", "bik", "gravel"])
+        unit = "kph" if is_cycling else "/km"
+        decimals = 1 if is_cycling else 0
+        percentiles = [5, 25, 50, 75, 80, 95]
+        p_labels = [f"p{p:02d}" for p in percentiles]
 
-def export_panel(bundle: ActivityBundle, rendered: dict[str, Any]) -> None:
+        if "speed_m_s" in bundle.dataframe.columns:
+            valid_speeds = bundle.dataframe["speed_m_s"][bundle.dataframe["speed_m_s"] > 0]
+            if not valid_speeds.empty:
+                p_vals = np.percentile(valid_speeds * 3.6, percentiles)
+                st.markdown("<div style='text-align:center; font-size:1.1rem; font-weight:700; margin: 1.5rem 0 0.85rem;'>Speed / Pace Percentiles</div>", unsafe_allow_html=True)
+                p_cols = st.columns(len(percentiles))
+                for col, lbl, val in zip(p_cols, p_labels, p_vals):
+                    col.metric(lbl, format_value(val, unit, decimals))
+
+        st.markdown("<div style='text-align:center; font-size:1.1rem; font-weight:700; margin: 1.5rem 0 0.85rem;'>All Metrics Percentiles</div>", unsafe_allow_html=True)
+        percentile_data = []
+        metrics_map = {
+            "speed_m_s": ("Speed/Pace", unit, decimals),
+            "heartrate": ("Heart Rate", "bpm", 0),
+            "cadence": ("Cadence", "rpm", 0),
+            "watts": ("Power", "W", 0),
+            "altitude_m": ("Altitude", "m", 0)
+        }
+        for col_name, (m_label, m_unit, m_dec) in metrics_map.items():
+            if col_name in bundle.dataframe.columns:
+                valid_data = bundle.dataframe[col_name].dropna()
+                if not valid_data.empty and (valid_data > 0).any():
+                    if col_name == "speed_m_s":
+                        valid_data = valid_data[valid_data > 0] * 3.6
+                    p_vals = np.percentile(valid_data, percentiles)
+                    row_data = {"Metric": m_label}
+                    for lbl, val in zip(p_labels, p_vals):
+                        row_data[lbl] = format_value(val, m_unit, m_dec)
+                    percentile_data.append(row_data)
+
+        if percentile_data:
+            st.dataframe(pd.DataFrame(percentile_data), width="stretch", hide_index=True)
+
+        st.markdown("<div style='text-align:center; font-size:1.1rem; font-weight:700; margin: 1.5rem 0 0.85rem;'>Speed Distribution</div>", unsafe_allow_html=True)
+        bins = st.slider("Histogram bins", min_value=5, max_value=50, value=20, step=1)
+        if "speed_m_s" in bundle.dataframe.columns:
+            valid_speeds_kph = bundle.dataframe["speed_m_s"][bundle.dataframe["speed_m_s"] > 0] * 3.6
+            if not valid_speeds_kph.empty:
+                counts, bin_edges = np.histogram(valid_speeds_kph, bins=bins)
+                shares = counts / counts.sum()
+                bin_labels = []
+                for i in range(len(counts)):
+                    start_str = format_value(bin_edges[i], unit, decimals).replace(unit, '').strip()
+                    end_str = format_value(bin_edges[i+1], unit, decimals)
+                    bin_labels.append(f"{start_str} - {end_str}")
+                
+                hist_df = pd.DataFrame({"Relative Share": shares}, index=bin_labels)
+                st.bar_chart(hist_df, y="Relative Share")
+                
+                hist_w, hist_h = 1000, 400
+                hist_img = Image.new("RGBA", (hist_w, hist_h), (0,0,0,0))
+                draw = ImageDraw.Draw(hist_img)
+                max_share = shares.max()
+                if max_share > 0:
+                    bar_w = hist_w / len(shares)
+                    for i, share in enumerate(shares):
+                        draw.rectangle([i * bar_w, hist_h - (share / max_share) * hist_h, (i * bar_w) + bar_w * 0.85, hist_h], fill=to_rgba(config["track_color"], 255))
+                
+                buf = io.BytesIO()
+                hist_img.save(buf, format="PNG")
+                st.download_button("Download Transparent Histogram PNG", buf.getvalue(), file_name=f"histogram_export.png", mime="image/png", width="stretch")
+
+
+def format_filename(bundle: ActivityBundle, asset_type: str, suffix: str) -> str:
+    safe_title = re.sub(r'[^A-Za-z0-9_-]', '', bundle.title.replace(' ', '_'))
+    dist_km = float(bundle.stats.get("distance_m") or 0.0) / 1000.0
+    return f"{bundle.date_str}_{safe_title}_{dist_km:.1f}km_{asset_type}.{suffix}"
+
+
+def export_panel(bundle: ActivityBundle, config: dict[str, Any], rendered: dict[str, Any]) -> None:
     preview, downloads = st.columns([1.35, 1])
+    
+    # Pre-render the stats image so we can show a preview and download it
+    stats_png_bytes = render_stats_png(bundle, config)
+    
     with preview:
-        st.markdown("### Preview")
-        st.image(rendered["still"], width="stretch")
-        st.caption("The preview uses the current canvas, track color, and stat settings.")
+        st.markdown("### Previews")
+        st.image(rendered["still"], width="stretch", caption="Track Asset Preview")
+        st.image(stats_png_bytes, width="stretch", caption="Stats Overlay Preview")
+        
     with downloads:
-        st.markdown("### Downloads")
+        st.markdown("### Exports")
+        
+        # Track Asset Downloads
         still_buffer = io.BytesIO()
         rendered["still"].save(still_buffer, format="PNG")
-        st.download_button("Download PNG", data=still_buffer.getvalue(), file_name=f"{bundle.title}.png", mime="image/png", width="stretch")
-        st.download_button("Download GIF", data=rendered["gif"], file_name=f"{bundle.title}.gif", mime="image/gif", width="stretch")
-        st.download_button("Download WebM", data=rendered["webm"], file_name=f"{bundle.title}.webm", mime="video/webm", width="stretch")
-        st.download_button("Download MP4", data=rendered["mp4"], file_name=f"{bundle.title}.mp4", mime="video/mp4", width="stretch")
-        st.info("GIF and WebM preserve transparency best. MP4 is included for compatibility and may be flattened by some players.")
+        
+        st.download_button("Download Track PNG", data=still_buffer.getvalue(), file_name=format_filename(bundle, "track", "png"), mime="image/png", width="stretch")
+        st.download_button("Download GIF", data=rendered["gif"], file_name=format_filename(bundle, "track", "gif"), mime="image/gif", width="stretch")
+        st.download_button("Download WebM", data=rendered["webm"], file_name=format_filename(bundle, "track", "webm"), mime="video/webm", width="stretch")
+        st.info("GIF and WebM preserve transparency best.")
+        
+        st.divider()
+        
+        # New Stats Overlay Download
+        st.markdown("### Export Stats Overlay")
+        st.caption("PNG with selected stats from the sidebar table.")
+        st.download_button(
+            "Download Stats PNG", 
+            data=stats_png_bytes, 
+            file_name=format_filename(bundle, "stats", "png"), 
+            mime="image/png", 
+            width="stretch"
+        )
+        
 
 
 def main() -> None:
     set_page()
     st.markdown(f"<div class='hero'><h1>{APP_TITLE}</h1><p>{APP_SUBTITLE}</p></div>", unsafe_allow_html=True)
 
-    st.sidebar.markdown("### Source")
-    source_mode = st.sidebar.radio("Input", ["Upload GPX/FIT", "Garmin Connect"], horizontal=False)
+    source_mode = st.sidebar.radio("Input", ["Upload GPX/FIT/TCX", "Garmin Connect"], horizontal=False)
     bundle: ActivityBundle | None = None
 
-    if source_mode == "Upload GPX/FIT":
-        upload = st.sidebar.file_uploader("Upload GPX or FIT", type=["gpx", "fit"], accept_multiple_files=False)
+    if source_mode == "Upload GPX/FIT/TCX":
+        upload = st.sidebar.file_uploader("Upload GPX, FIT, or TCX", type=["gpx", "fit", "tcx"], accept_multiple_files=False)
         bundle = uploaded_bundle(upload)
     else:
         st.sidebar.caption("Use personal Garmin Connect credentials for your own activities.")
@@ -801,22 +1175,23 @@ def main() -> None:
             st.sidebar.info("Enter Garmin credentials and click Login to fetch the latest 100 activities.")
 
     if bundle is None:
-        st.info("Upload a GPX/FIT file or log in to Garmin Connect to start.")
+        st.info("Upload a GPX/FIT/TCX file or log in to Garmin Connect to start.")
         return
 
     if bundle.dataframe.empty or not {"lat", "lon"}.issubset(bundle.dataframe.columns):
         st.error("The activity data does not contain enough GPS coordinates to render a route.")
         return
 
-    bundle_overview(bundle)
     config = sidebar_controls(bundle)
+    bundle_overview(bundle, config)
 
     with st.spinner("Rendering assets..."):
-        rendered = render_bundle(bundle.dataframe, build_stat_table(bundle.stats, config["stats_rows"]), config)
+        rendered = render_bundle(bundle.dataframe, config)
 
-    export_panel(bundle, rendered)
+    export_panel(bundle, config, rendered)
+    
     st.markdown("### Track data")
-    st.dataframe(bundle.dataframe.head(200), width="stretch")
+    st.dataframe(bundle.dataframe.head(100), width="stretch")
 
 
 if __name__ == "__main__":
