@@ -17,7 +17,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from fitparse import FitFile
-from garminconnect import Garmin
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 
@@ -28,6 +33,7 @@ DEFAULT_TRACK_COLOR = "#FC4C02"
 DEFAULT_BACKGROUND = (0, 0, 0, 0)
 DEFAULT_FPS = 30
 DEFAULT_DURATION_SECONDS = 8
+GARMIN_TOKEN_DIR = Path("data") / "garminconnect"
 
 STAT_DEFINITIONS = [
     ("avg_speed", "Avg speed", "kph"),
@@ -572,26 +578,71 @@ def garmin_login() -> Garmin | None:
     if st.session_state.get("garmin_client") is not None:
         return st.session_state["garmin_client"]
 
-    email_default = safe_secrets_path("garmin", "EMAIL") or ""
-    password_default = safe_secrets_path("garmin", "PASSWORD") or ""
-    email = st.sidebar.text_input("Garmin email", value=email_default)
-    password = st.sidebar.text_input("Garmin password", value=password_default, type="password")
-    auto_login = bool(email and password and email_default and password_default)
-    login_requested = st.sidebar.button("Login to Garmin", use_container_width=True)
+    GARMIN_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    token_store = str(GARMIN_TOKEN_DIR)
 
-    if not (login_requested or auto_login):
-        return None
+    with st.sidebar.form("garmin_login_form", clear_on_submit=False):
+        email_default = safe_secrets_path("garmin", "EMAIL") or ""
+        password_default = safe_secrets_path("garmin", "PASSWORD") or ""
+        email = st.text_input("Garmin email", value=email_default)
+        password = st.text_input("Garmin password", value=password_default, type="password")
+        submit = st.form_submit_button("Login to Garmin")
 
-    try:
-        client = Garmin(email, password)
-        client.login()
-        st.session_state["garmin_client"] = client
-        st.session_state["garmin_email"] = email
-        st.sidebar.success("Garmin login ready")
-        return client
-    except Exception as exc:
-        st.sidebar.error(f"Garmin login failed: {exc}")
-        return None
+    if submit:
+        try:
+            client = Garmin(email, password, return_on_mfa=True)
+            login_result = client.login(token_store)
+            if isinstance(login_result, tuple) and len(login_result) == 2:
+                mfa_status, state = login_result
+            else:
+                mfa_status, state = None, None
+
+            if mfa_status == "NEEDS_MFA":
+                st.session_state["garmin_pending_client"] = client
+                st.session_state["garmin_pending_state"] = state
+                st.session_state["garmin_email"] = email
+                st.session_state.pop("garmin_client", None)
+                st.warning("Garmin requires MFA. Enter the code below to finish login.")
+            else:
+                st.session_state["garmin_client"] = client
+                st.session_state["garmin_email"] = email
+                st.session_state.pop("garmin_pending_client", None)
+                st.session_state.pop("garmin_pending_state", None)
+                st.success("Garmin login ready")
+        except GarminConnectTooManyRequestsError:
+            st.error("Garmin rate-limited this IP. Wait a few minutes before trying again.")
+        except GarminConnectAuthenticationError as exc:
+            st.error(f"Garmin authentication failed: {exc}")
+        except GarminConnectConnectionError as exc:
+            st.error(f"Garmin connection failed: {exc}")
+        except Exception as exc:
+            st.error(f"Garmin login failed: {exc}")
+
+    pending_client = st.session_state.get("garmin_pending_client")
+    pending_state = st.session_state.get("garmin_pending_state")
+    if pending_client is not None and pending_state is not None:
+        with st.sidebar.form("garmin_mfa_form", clear_on_submit=False):
+            mfa_code = st.text_input("MFA code", value="", placeholder="Enter the code from Garmin")
+            mfa_submit = st.form_submit_button("Verify MFA")
+
+        if mfa_submit:
+            try:
+                pending_client.resume_login(pending_state, mfa_code)
+                st.session_state["garmin_client"] = pending_client
+                st.session_state.pop("garmin_pending_client", None)
+                st.session_state.pop("garmin_pending_state", None)
+                st.success("Garmin MFA verified")
+                return pending_client
+            except GarminConnectTooManyRequestsError:
+                st.error("Garmin rate-limited this IP while verifying MFA. Wait before retrying.")
+            except GarminConnectAuthenticationError as exc:
+                st.error(f"Garmin MFA failed: {exc}")
+            except GarminConnectConnectionError as exc:
+                st.error(f"Garmin connection failed: {exc}")
+            except Exception as exc:
+                st.error(f"Garmin MFA verification failed: {exc}")
+
+    return st.session_state.get("garmin_client")
 
 
 def garmin_activity_bundle(client: Garmin, limit: int) -> ActivityBundle | None:
