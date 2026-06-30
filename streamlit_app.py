@@ -20,6 +20,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 from fitparse import FitFile
 from garminconnect import (
     Garmin,
@@ -49,11 +51,14 @@ CANVAS_OPTIONS = {
     "Story 1080x1920": (1080, 1920),
 }
 
+COLOR_RAMPS = ["viridis", "plasma", "inferno", "magma", "cividis", "turbo", "coolwarm"]
+METRICS_MAP = ["Solid Color", "Elevation", "Speed", "Heart Rate", "Power"]
+
 # (Key, Default Label, Default Unit, Default Decimals)
 STAT_DEFINITIONS = [
     ("distance_m", "Distance", "km", 1),
     ("moving_time", "Time", "", 0),
-    ("avg_speed", "Speed/Pace", "kph", 1), # Dynamically overridden
+    ("avg_speed", "Speed/Pace", "kph", 1),
     ("elevation_gain", "Elev Gain", "m", 0),
     ("avg_heart_rate", "Avg HR", "bpm", 0),
     ("avg_cadence", "Avg Cadence", "rpm", 0),
@@ -136,21 +141,15 @@ def format_value(value: Any, unit: str, decimals: int = 0) -> str:
     
     if unit == "km":
         return f"{val_f / 1000.0:.{decimals}f} km"
-        
     if unit == "kph":
         return f"{val_f:.{decimals}f} kph"
-        
     if unit in {"/km", "min/km"}:
         if val_f <= 0:
             return "-"
         pace_seconds = 3600.0 / val_f
         return f"{format_duration(pace_seconds)}/km"
-            
     if unit == "":
         return format_duration(value)
-        
-    if unit in {"m", "W", "bpm", "kcal", "rpm"}:
-        return f"{val_f:.{decimals}f} {unit}".strip()
         
     return f"{val_f:.{decimals}f} {unit}".strip()
 
@@ -190,10 +189,8 @@ def cumulative_distance(points: pd.DataFrame) -> pd.Series:
             distances.append(
                 distances[-1]
                 + haversine_m(
-                    float(previous["lat"]),
-                    float(previous["lon"]),
-                    float(current["lat"]),
-                    float(current["lon"]),
+                    float(previous["lat"]), float(previous["lon"]),
+                    float(current["lat"]), float(current["lon"]),
                 )
             )
         return pd.Series(distances, index=points.index, dtype=float)
@@ -241,7 +238,6 @@ def compute_stats(frame: pd.DataFrame, fallback: dict[str, Any] | None = None, s
             if pd.notna(start) and pd.notna(end):
                 elapsed_time = float((end - start).total_seconds())
                 
-        # Re-calc moving time dynamically based on the threshold parameter
         moving_mask = speeds > stopped_threshold_ms
         moving_time = float(time_diff[moving_mask].sum())
 
@@ -289,7 +285,6 @@ def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFr
         return track_points
         
     max_dist = float(track_points["distance_m"].iloc[-1])
-    
     trimmed = track_points[
         (track_points["distance_m"] >= start_trim_m) & 
         (track_points["distance_m"] <= (max_dist - end_trim_m))
@@ -297,7 +292,6 @@ def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFr
     
     if trimmed.empty:
         return track_points.iloc[:1].reset_index(drop=True)
-        
     return trimmed.reset_index(drop=True)
 
 
@@ -421,12 +415,59 @@ def resample_polyline(points_xy: np.ndarray, target_points: int = 800) -> np.nda
     return np.column_stack([x, y])
 
 
-def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, color: str, width: int = 9) -> None:
+def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len: int) -> list[tuple[int, int, int, int]]:
+    mode = config.get("color_mode", "Solid Color")
+    ramp = config.get("color_ramp", "turbo")
+    
+    if mode == "Solid Color":
+        return [to_rgba(config["track_color"])] * target_len
+        
+    metric_mapping = {
+        "Elevation": "altitude_m",
+        "Speed": "speed_m_s",
+        "Heart Rate": "heartrate",
+        "Power": "watts"
+    }
+    
+    metric = metric_mapping.get(mode)
+    if metric not in points.columns:
+        return [to_rgba(config["track_color"])] * target_len
+        
+    values = points[metric].fillna(0).to_numpy()
+    if len(values) == 0 or values.max() == values.min():
+        return [to_rgba(config["track_color"])] * target_len
+        
+    orig_indices = np.linspace(0, 1, len(values))
+    target_indices = np.linspace(0, 1, target_len)
+    interp_values = np.interp(target_indices, orig_indices, values)
+    
+    cmap_name = ramp
+    if config.get("invert_color_ramp", False):
+        cmap_name += "_r"
+        
+    norm = mcolors.Normalize(vmin=interp_values.min(), vmax=interp_values.max())
+    cmap = cm.get_cmap(cmap_name)
+    
+    return [tuple(int(c * 255) for c in cmap(norm(v))[:4]) for v in interp_values]
+
+
+def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, config: dict[str, Any], raw_points: pd.DataFrame) -> None:
     draw = ImageDraw.Draw(image)
     limit = max(2, int(round((len(points_xy) - 1) * progress)))
-    track = [tuple(point) for point in points_xy[:limit]]
-    if len(track) > 1:
-        draw.line(track, fill=to_rgba(color, 255), width=width, joint="curve")
+    
+    mode = config.get("color_mode", "Solid Color")
+    width = config["track_width"]
+    
+    if mode == "Solid Color":
+        track = [tuple(point) for point in points_xy[:limit]]
+        if len(track) > 1:
+            draw.line(track, fill=to_rgba(config["track_color"], 255), width=width, joint="curve")
+    else:
+        colors = get_segment_colors(raw_points, config, len(points_xy))
+        for i in range(limit - 1):
+            p1 = tuple(points_xy[i])
+            p2 = tuple(points_xy[i+1])
+            draw.line([p1, p2], fill=colors[i], width=width, joint="curve")
 
 
 def render_frame(points: pd.DataFrame, config: dict[str, Any], progress: float) -> Image.Image:
@@ -442,28 +483,38 @@ def render_frame(points: pd.DataFrame, config: dict[str, Any], progress: float) 
         project_track(points, size),
         target_points=len(points),
     )
-    draw_progress(base, points_xy, progress, config["track_color"], width=config["track_width"])
+    draw_progress(base, points_xy, progress, config, points)
     return base
 
 
-def encode_gif(frames: list[Image.Image], fps: int) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as temp_file:
+def encode_video_stream(points: pd.DataFrame, config: dict[str, Any], fmt: str) -> bytes:
+    effective_duration = config["duration_seconds"] / max(config["speed_multiplier"], 0.1)
+    total_frames = max(12, int(round(config["fps"] * effective_duration)))
+    progress_values = np.linspace(0.0, 1.0, total_frames)
+    track_points = trim_track_points(points, config)
+    pause_frames = int(round(config["fps"] * config.get("end_pause_seconds", 0)))
+    
+    with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as temp_file:
         temp_path = temp_file.name
+        
     try:
-        imageio.mimsave(temp_path, [np.array(frame) for frame in frames], duration=1 / max(fps, 1), loop=0)
-        return Path(temp_path).read_bytes()
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def encode_webm(frames: list[Image.Image], fps: int) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
-        temp_path = temp_file.name
-    try:
-        with imageio.get_writer(temp_path, fps=fps, codec="libvpx-vp9", macro_block_size=None, ffmpeg_log_level="error", output_params=["-pix_fmt", "yuva420p"]) as writer:
-            for frame in frames:
-                writer.append_data(np.array(frame))
+        if fmt == "webm":
+            writer = imageio.get_writer(temp_path, fps=config["fps"], codec="libvpx-vp9", macro_block_size=None, ffmpeg_log_level="error", output_params=["-pix_fmt", "yuva420p"])
+        else:
+            writer = imageio.get_writer(temp_path, duration=1 / max(config["fps"], 1), loop=0)
+            
+        last_frame = None
+        for progress in progress_values:
+            frame = render_frame(track_points, config, progress)
+            writer.append_data(np.array(frame))
+            last_frame = frame
+            
+        if pause_frames > 0 and last_frame is not None:
+            last_frame_arr = np.array(last_frame)
+            for _ in range(pause_frames):
+                writer.append_data(last_frame_arr)
+                
+        writer.close()
         return Path(temp_path).read_bytes()
     finally:
         if os.path.exists(temp_path):
@@ -471,76 +522,83 @@ def encode_webm(frames: list[Image.Image], fps: int) -> bytes:
 
 
 def render_bundle(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]:
-    effective_duration = config["duration_seconds"] / max(config["speed_multiplier"], 0.1)
-    total_frames = max(12, int(round(config["fps"] * effective_duration)))
-    progress_values = np.linspace(0.0, 1.0, total_frames)
     track_points = trim_track_points(points, config)
-    
-    frames = [render_frame(track_points, config, progress) for progress in progress_values]
-    
-    pause_frames = int(round(config["fps"] * config.get("end_pause_seconds", 0)))
-    if pause_frames > 0 and frames:
-        frames.extend([frames[-1]] * pause_frames)
-
+    # We only render the final still frame to save memory
+    # Videos are generated exclusively when hitting their respective download buttons
     return {
-        "still": frames[-1],
-        "frames": frames,
-        "gif": encode_gif(frames, config["fps"]),
-        "webm": encode_webm(frames, config["fps"]),
+        "still": render_frame(track_points, config, 1.0)
     }
 
 
 def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
-    """Renders the stats UI dynamically based on the enabled stats and custom decimals."""
-    width, height = 800, 360
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    
-    font_size = config["stats_font_size"]
-    drop_shadow = config["stats_png_drop_shadow"]
-    
+    """Renders the stats UI dynamically adapting bounding boxes to fix cloud layout drift."""
     enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
     
     if not enabled_stats:
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return b""
         
-    num_stats = len(enabled_stats)
-    cols = 2
-    rows = math.ceil(num_stats / cols)
+    font_size = config["stats_font_size"]
+    drop_shadow = config["stats_png_drop_shadow"]
     
     value_font = get_font(font_size + 12)
     label_font = get_font(max(12, font_size - 4))
     
-    pad_x, pad_y = 20, 20
-    box_w = (width - pad_x * (cols + 1)) // cols
-    box_h = (height - pad_y * (rows + 1)) // rows
+    dummy_img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(dummy_img)
     
-    for i, stat_row in enumerate(enabled_stats):
+    pad_x, pad_y = 40, 30
+    max_w, max_h = 0, 0
+    
+    processed_stats = []
+    for stat_row in enabled_stats:
+        label = stat_row["label"]
+        raw_val = bundle.stats.get(stat_row["key"])
+        value = format_value(raw_val, stat_row["unit"], stat_row.get("decimals", 0))
+        
+        l_bbox = draw.textbbox((0, 0), label, font=label_font)
+        v_bbox = draw.textbbox((0, 0), value, font=value_font)
+        
+        lx = l_bbox[2] - l_bbox[0]
+        ly = l_bbox[3] - l_bbox[1]
+        vx = v_bbox[2] - v_bbox[0]
+        vy = v_bbox[3] - v_bbox[1]
+        
+        cell_w = max(lx, vx)
+        cell_h = ly + vy + 10 
+        
+        max_w = max(max_w, cell_w)
+        max_h = max(max_h, cell_h)
+        
+        processed_stats.append((label, value, lx, ly, vx, vy))
+
+    cols = min(2, len(enabled_stats))
+    rows = math.ceil(len(enabled_stats) / cols)
+    
+    cell_box_w = max_w + (pad_x * 2)
+    cell_box_h = max_h + (pad_y * 2)
+    
+    total_width = cell_box_w * cols
+    total_height = cell_box_h * rows
+    
+    img = Image.new("RGBA", (total_width, total_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    for i, (label, value, lx, ly, vx, vy) in enumerate(processed_stats):
         col = i % cols
         r = i // cols
         
-        x0 = pad_x + col * (box_w + pad_x)
-        
-        if i == num_stats - 1 and num_stats % 2 != 0:
-            x0 = (width - box_w) / 2
+        if i == len(enabled_stats) - 1 and len(enabled_stats) % 2 != 0:
+            x0 = (total_width - cell_box_w) // 2
+        else:
+            x0 = col * cell_box_w
             
-        y0 = pad_y + r * (box_h + pad_y)
+        y0 = r * cell_box_h
         
-        label = stat_row["label"]
-        raw_val = bundle.stats.get(stat_row["key"])
+        label_x = x0 + (cell_box_w - lx) // 2
+        label_y = y0 + pad_y
         
-        # Apply the user's custom decimal choice when rendering!
-        value = format_value(raw_val, stat_row["unit"], stat_row.get("decimals", 0))
-            
-        _, _, lx, ly = draw.textbbox((0, 0), label, font=label_font)
-        label_x = x0 + (box_w - lx) / 2
-        label_y = y0 + box_h / 2 - ly - 5
-        
-        _, _, vx, vy = draw.textbbox((0, 0), value, font=value_font)
-        val_x = x0 + (box_w - vx) / 2
-        val_y = y0 + box_h / 2 + 5
+        val_x = x0 + (cell_box_w - vx) // 2
+        val_y = label_y + ly + 10
         
         if drop_shadow:
             shadow_offset = max(1, font_size // 15)
@@ -573,8 +631,6 @@ def parse_gpx_bytes(data: bytes) -> tuple[pd.DataFrame, str]:
                     "lon": point.longitude, 
                     "altitude_m": point.elevation
                 }
-                
-                # Extract extensions (e.g. Heart Rate, Cadence)
                 for ext in point.extensions:
                     for child in ext:
                         tag = child.tag.lower()
@@ -588,7 +644,6 @@ def parse_gpx_bytes(data: bytes) -> tuple[pd.DataFrame, str]:
                                     row['watts'] = float(child.text)
                             except ValueError:
                                 pass
-                                
                 rows.append(row)
                 
     frame = pd.DataFrame(rows)
@@ -899,7 +954,6 @@ def stat_editor_defaults(stats: dict[str, Any], activity_type: str) -> pd.DataFr
     if stats.get("avg_heart_rate"): default_keys.append("avg_heart_rate")
     
     for order, (key, label, unit, decimals) in enumerate(STAT_DEFINITIONS, start=1):
-        # Override Speed vs Pace automatically based on activity type
         if key == "avg_speed":
             if is_cycling:
                 label = "Speed"
@@ -907,7 +961,7 @@ def stat_editor_defaults(stats: dict[str, Any], activity_type: str) -> pd.DataFr
             else:
                 label = "Pace"
                 unit = "/km"
-                decimals = 0 # Min/sec layout doesn't use decimals
+                decimals = 0 
 
         formatted_val = format_value(stats.get(key), unit, decimals)
         rows.append({
@@ -928,10 +982,20 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
         st.session_state.default_end_trim = random.randint(100, 750)
 
     st.sidebar.markdown("### Render settings")
-    output_size_name = st.sidebar.selectbox("Canvas size", list(CANVAS_OPTIONS.keys()), index=1)
+    output_size_name = st.sidebar.selectbox("Canvas size", list(CANVAS_OPTIONS.keys()), index=0)
     size_lookup = CANVAS_OPTIONS
     background_mode = st.sidebar.selectbox("Background", ["transparent", "bw"], format_func=lambda value: "Transparent" if value == "transparent" else "Black & white map", index=0)
-    color = st.sidebar.color_picker("Track color", value=DEFAULT_TRACK_COLOR)
+    
+    color_mode = st.sidebar.selectbox("Color mapping", METRICS_MAP)
+    invert_color_ramp = False
+    if color_mode == "Solid Color":
+        color = st.sidebar.color_picker("Track color", value=DEFAULT_TRACK_COLOR)
+        color_ramp = "turbo"
+    else:
+        color = DEFAULT_TRACK_COLOR
+        color_ramp = st.sidebar.selectbox("Color ramp", COLOR_RAMPS)
+        invert_color_ramp = st.sidebar.toggle("Invert color ramp", value=False)
+        
     track_width = st.sidebar.number_input("Track width", min_value=1, max_value=40, value=9, step=1)
     fps = st.sidebar.number_input("Animation FPS", min_value=1, max_value=60, value=DEFAULT_FPS, step=1)
     duration_seconds = st.sidebar.number_input("Total duration (seconds)", min_value=1, max_value=60, value=DEFAULT_DURATION_SECONDS, step=1)
@@ -941,7 +1005,6 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
     st.sidebar.markdown("### Data Analytics")
     stopped_threshold_ms = st.sidebar.slider("Stopped speed threshold (m/s)", 0.0, 3.0, 1.1, 0.1, help="Speeds below this threshold will not be counted in moving time.")
     st.sidebar.markdown(f"Speed below {stopped_threshold_ms * 3.6:.1f} kph is considered stopped.")
-    # Dynamically re-calculate stats using the user's stopped threshold
     bundle.stats = compute_stats(bundle.dataframe, fallback=bundle.fallback_stats, stopped_threshold_ms=stopped_threshold_ms)
     
     st.sidebar.markdown("### Stat Overlay Settings")
@@ -954,7 +1017,6 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
     privacy_start_trim_m = st.sidebar.slider("Trim from start (meters)", min_value=0, max_value=5000, value=st.session_state.default_start_trim, step=50)
     privacy_end_trim_m = st.sidebar.slider("Trim from end (meters)", min_value=0, max_value=5000, value=st.session_state.default_end_trim, step=50)
     
-    # Initialize the data editor layout with auto-detected Pace/Speed labels based on type
     stats_df = st.sidebar.data_editor(
         stat_editor_defaults(bundle.stats, bundle.activity_type),
         hide_index=True,
@@ -979,6 +1041,9 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
         "output_size": size_lookup[output_size_name],
         "background_mode": background_mode,
         "track_color": color,
+        "color_mode": color_mode,
+        "color_ramp": color_ramp,
+        "invert_color_ramp": invert_color_ramp,
         "track_width": track_width,
         "fps": fps,
         "duration_seconds": duration_seconds,
@@ -1015,7 +1080,6 @@ def bundle_overview(bundle: ActivityBundle, config: dict[str, Any]) -> None:
     for i, stat_row in enumerate(enabled_stats):
         col_idx = i % 2
         
-        # Center the final item if odd by putting it in a container that spans cols
         if i == num_stats - 1 and num_stats % 2 != 0:
             with st.container():
                 st.markdown(
@@ -1042,7 +1106,6 @@ def bundle_overview(bundle: ActivityBundle, config: dict[str, Any]) -> None:
     with st.expander("All computed stats", expanded=False):
         st.dataframe(pd.DataFrame([{ "metric": key, "value": value } for key, value in bundle.stats.items()]), width="stretch", hide_index=True)
 
-        # Percentiles and Histogram additions
         is_cycling = any(kw in bundle.activity_type.lower() for kw in ["cycl", "bik", "gravel"])
         unit = "kph" if is_cycling else "/km"
         decimals = 1 if is_cycling else 0
@@ -1089,14 +1152,16 @@ def bundle_overview(bundle: ActivityBundle, config: dict[str, Any]) -> None:
             if not valid_speeds_kph.empty:
                 counts, bin_edges = np.histogram(valid_speeds_kph, bins=bins)
                 shares = counts / counts.sum()
-                bin_labels = []
-                for i in range(len(counts)):
-                    start_str = format_value(bin_edges[i], unit, decimals).replace(unit, '').strip()
-                    end_str = format_value(bin_edges[i+1], unit, decimals)
-                    bin_labels.append(f"{start_str} - {end_str}")
                 
-                hist_df = pd.DataFrame({"Relative Share": shares}, index=bin_labels)
-                st.bar_chart(hist_df, y="Relative Share")
+                # Format properly numerical upper edges so Streamlit sorts it properly vs treating as string label
+                upper_edges = np.round(bin_edges[1:], decimals=decimals)
+                
+                hist_df = pd.DataFrame({
+                    "Relative Share": shares,
+                    "Speed Upper": upper_edges
+                })
+                
+                st.bar_chart(hist_df, x="Speed Upper", y="Relative Share")
                 
                 hist_w, hist_h = 1000, 400
                 hist_img = Image.new("RGBA", (hist_w, hist_h), (0,0,0,0))
@@ -1118,42 +1183,61 @@ def format_filename(bundle: ActivityBundle, asset_type: str, suffix: str) -> str
     return f"{bundle.date_str}_{safe_title}_{dist_km:.1f}km_{asset_type}.{suffix}"
 
 
+@st.cache_data(show_spinner=False)
+def generate_cached_video(dataframe: pd.DataFrame, config: dict[str, Any], fmt: str) -> bytes:
+    """Caching prevents re-encoding the video repeatedly on minor UI interactions."""
+    return encode_video_stream(dataframe, config, fmt)
+
+
 def export_panel(bundle: ActivityBundle, config: dict[str, Any], rendered: dict[str, Any]) -> None:
     preview, downloads = st.columns([1.35, 1])
     
-    # Pre-render the stats image so we can show a preview and download it
     stats_png_bytes = render_stats_png(bundle, config)
     
     with preview:
         st.markdown("### Previews")
-        st.image(rendered["still"], width="stretch", caption="Track Asset Preview")
-        st.image(stats_png_bytes, width="stretch", caption="Stats Overlay Preview")
+        st.image(rendered["still"], width="stretch", caption="Track Asset Preview (Final Frame)")
+        if stats_png_bytes:
+            st.image(stats_png_bytes, width="stretch", caption="Stats Overlay Preview")
         
     with downloads:
         st.markdown("### Exports")
         
-        # Track Asset Downloads
         still_buffer = io.BytesIO()
         rendered["still"].save(still_buffer, format="PNG")
-        
         st.download_button("Download Track PNG", data=still_buffer.getvalue(), file_name=format_filename(bundle, "track", "png"), mime="image/png", width="stretch")
-        st.download_button("Download GIF", data=rendered["gif"], file_name=format_filename(bundle, "track", "gif"), mime="image/gif", width="stretch")
-        st.download_button("Download WebM", data=rendered["webm"], file_name=format_filename(bundle, "track", "webm"), mime="video/webm", width="stretch")
-        st.info("GIF and WebM preserve transparency best.")
         
         st.divider()
-        
-        # New Stats Overlay Download
         st.markdown("### Export Stats Overlay")
         st.caption("PNG with selected stats from the sidebar table.")
-        st.download_button(
-            "Download Stats PNG", 
-            data=stats_png_bytes, 
-            file_name=format_filename(bundle, "stats", "png"), 
-            mime="image/png", 
-            width="stretch"
-        )
+        if stats_png_bytes:
+            st.download_button(
+                "Download Stats PNG", 
+                data=stats_png_bytes, 
+                file_name=format_filename(bundle, "stats", "png"), 
+                mime="image/png", 
+                width="stretch"
+            )
+            
+        st.divider()
+        st.markdown("### Export Video")
+        st.caption("Videos consume high memory and take a minute to encode. Generate manually below.")
         
+        video_format = st.selectbox("Format", ["gif", "webm"])
+        if st.button(f"Render and Download {video_format.upper()}", use_container_width=True):
+            with st.spinner(f"Encoding {video_format.upper()} stream..."):
+                video_bytes = generate_cached_video(bundle.dataframe, config, video_format)
+                st.session_state[f"cached_video_export_{video_format}"] = video_bytes
+        
+        if f"cached_video_export_{video_format}" in st.session_state:
+            st.success(f"{video_format.upper()} encoding complete.")
+            st.download_button(
+                f"Save Generated {video_format.upper()}", 
+                data=st.session_state[f"cached_video_export_{video_format}"], 
+                file_name=format_filename(bundle, "track", video_format), 
+                mime=f"video/{video_format}" if video_format == "webm" else f"image/{video_format}", 
+                width="stretch"
+            )
 
 
 def main() -> None:
@@ -1185,7 +1269,7 @@ def main() -> None:
     config = sidebar_controls(bundle)
     bundle_overview(bundle, config)
 
-    with st.spinner("Rendering assets..."):
+    with st.spinner("Rendering fast preview..."):
         rendered = render_bundle(bundle.dataframe, config)
 
     export_panel(bundle, config, rendered)
