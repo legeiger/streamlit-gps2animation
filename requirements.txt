@@ -1,6 +1,10 @@
 #altair
 pandas
 streamlit
-# streamlit_oauth
-stravalib
+garminconnect
+Pillow
+gpxpy
+fitparse
+imageio
+imageio-ffmpeg
 # flask
