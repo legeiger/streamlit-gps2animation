@@ -717,7 +717,7 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
     stats_df = st.sidebar.data_editor(
         stat_editor_defaults(bundle.stats),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         key="stats_editor",
         column_config={
@@ -761,23 +761,23 @@ def bundle_overview(bundle: ActivityBundle) -> None:
     for column, (label, value) in zip(cols, stat_cards, strict=False):
         column.metric(label, value)
     with st.expander("All computed stats", expanded=False):
-        st.dataframe(pd.DataFrame([{ "metric": key, "value": value } for key, value in bundle.stats.items()]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame([{ "metric": key, "value": value } for key, value in bundle.stats.items()]), width="stretch", hide_index=True)
 
 
 def export_panel(bundle: ActivityBundle, rendered: dict[str, Any]) -> None:
     preview, downloads = st.columns([1.35, 1])
     with preview:
         st.markdown("### Preview")
-        st.image(rendered["still"], use_container_width=True)
+        st.image(rendered["still"], width="stretch")
         st.caption("The preview uses the current canvas, track color, and stat settings.")
     with downloads:
         st.markdown("### Downloads")
         still_buffer = io.BytesIO()
         rendered["still"].save(still_buffer, format="PNG")
-        st.download_button("Download PNG", data=still_buffer.getvalue(), file_name=f"{bundle.title}.png", mime="image/png", use_container_width=True)
-        st.download_button("Download GIF", data=rendered["gif"], file_name=f"{bundle.title}.gif", mime="image/gif", use_container_width=True)
-        st.download_button("Download WebM", data=rendered["webm"], file_name=f"{bundle.title}.webm", mime="video/webm", use_container_width=True)
-        st.download_button("Download MP4", data=rendered["mp4"], file_name=f"{bundle.title}.mp4", mime="video/mp4", use_container_width=True)
+        st.download_button("Download PNG", data=still_buffer.getvalue(), file_name=f"{bundle.title}.png", mime="image/png", width="stretch")
+        st.download_button("Download GIF", data=rendered["gif"], file_name=f"{bundle.title}.gif", mime="image/gif", width="stretch")
+        st.download_button("Download WebM", data=rendered["webm"], file_name=f"{bundle.title}.webm", mime="video/webm", width="stretch")
+        st.download_button("Download MP4", data=rendered["mp4"], file_name=f"{bundle.title}.mp4", mime="video/mp4", width="stretch")
         st.info("GIF and WebM preserve transparency best. MP4 is included for compatibility and may be flattened by some players.")
 
 
@@ -816,7 +816,7 @@ def main() -> None:
 
     export_panel(bundle, rendered)
     st.markdown("### Track data")
-    st.dataframe(bundle.dataframe.head(200), use_container_width=True)
+    st.dataframe(bundle.dataframe.head(200), width="stretch")
 
 
 if __name__ == "__main__":
