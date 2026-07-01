@@ -561,7 +561,7 @@ def encode_video_stream(points: pd.DataFrame, config: dict[str, Any], fmt: str) 
             writer.append_data(np.array(frame))
             last_frame = frame
             
-        if pause_frames > 0 and last_frame is not None:
+        if pause_frames > 0 and last_frame == total_frames:
             last_frame_arr = np.array(last_frame)
             for _ in range(pause_frames):
                 writer.append_data(last_frame_arr)
