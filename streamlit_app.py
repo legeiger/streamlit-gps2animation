@@ -296,23 +296,33 @@ def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFr
     return trimmed.reset_index(drop=True)
 
 
-def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Robust font fallback to ensure high-resolution text scales correctly on all OS."""
-    candidates = [
-        "DejaVuSans.ttf", 
-        "Arial.ttf", 
-        "LiberationSans-Regular.ttf", 
-        "Helvetica.ttf", 
-        "Roboto-Regular.ttf",
-        "OpenSans-Regular.ttf",
-        "FreeMono.ttf"
-    ]
-    for candidate in candidates:
+def get_inter_font(weight: str = "Regular", size: int = 12) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """
+    Dynamically downloads and caches the Inter font (used natively by Strava)
+    to ensure crisp, identical typography across all cloud environments.
+    """
+    font_dir = Path("fonts")
+    font_dir.mkdir(exist_ok=True)
+    font_path = font_dir / f"Inter-{weight}.ttf"
+    
+    if not font_path.exists():
+        base_url = f"https://raw.githubusercontent.com/rsms/inter/master/docs/font-files/Inter-{weight}.ttf"
         try:
-            return ImageFont.truetype(candidate, size=size)
+            request = urllib.request.Request(base_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                font_path.write_bytes(response.read())
         except Exception:
-            continue
-    return ImageFont.load_default()
+            for candidate in ["DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"]:
+                try:
+                    return ImageFont.truetype(candidate, size=size)
+                except Exception:
+                    continue
+            return ImageFont.load_default()
+            
+    try:
+        return ImageFont.truetype(str(font_path), size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 
 def mercator_project(lat: float, lon: float, zoom: int) -> tuple[float, float]:
@@ -429,9 +439,6 @@ def resample_polyline(points_xy: np.ndarray, target_points: int = 800) -> np.nda
 def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len: int) -> list[tuple[int, int, int, int]]:
     mode = config.get("color_mode", "Solid Color")
     ramp = config.get("color_ramp", "turbo")
-    
-    # We always return alpha as 255 here, because global alpha compositing is 
-    # handled at the image layer in draw_progress to prevent overlapped darker joints.
     alpha_int = 255
     
     if mode == "Solid Color":
@@ -477,8 +484,6 @@ def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, co
     width = config["track_width"]
     alpha_mult = config.get("track_alpha", 1.0)
     
-    # Optimization: To prevent segment-overlap darkening when alpha is used,
-    # we draw solid to an overlay and composite it globally.
     if alpha_mult >= 0.99:
         target_img = image
         draw = ImageDraw.Draw(target_img)
@@ -497,7 +502,6 @@ def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, co
             p2 = tuple(points_xy[i+1])
             draw.line([p1, p2], fill=colors[i], width=width, joint="curve")
             
-    # Composite overlay if necessary
     if alpha_mult < 0.99:
         alpha_channel = target_img.split()[3]
         alpha_channel = alpha_channel.point(lambda p: int(p * alpha_mult))
@@ -558,34 +562,37 @@ def encode_video_stream(points: pd.DataFrame, config: dict[str, Any], fmt: str) 
 
 def render_bundle(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]:
     track_points = trim_track_points(points, config)
-    # We only render the final still frame to save memory
-    # Videos are generated exclusively when hitting their respective download buttons
     return {
         "still": render_frame(track_points, config, 1.0)
     }
 
 
 def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
-    """Renders the stats UI dynamically, scaled 3x for a crystal-clear high-definition PNG export."""
+    """Renders the stats UI dynamically, scaled 3x for high-definition with tight 400px variable-height layout."""
     enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
     
     if not enabled_stats:
         return b""
         
-    # Super-sampling scale multiplier
     export_scale = 3 
+    base_width = 400
+    actual_width = base_width * export_scale
     
-    font_size = config["stats_font_size"] * export_scale
-    drop_shadow = config["stats_png_drop_shadow"]
+    # Scale fonts relative to user setting
+    base_font_size = config["stats_font_size"]
+    label_size = max(10, base_font_size - 4) * export_scale
+    value_size = (base_font_size + 4) * export_scale
     
-    value_font = get_font(font_size + (12 * export_scale))
-    label_font = get_font(max(12 * export_scale, font_size - (4 * export_scale)))
+    label_font = get_inter_font("Regular", label_size)
+    value_font = get_inter_font("Bold", value_size)
     
     dummy_img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     draw = ImageDraw.Draw(dummy_img)
     
-    pad_x, pad_y = 40 * export_scale, 30 * export_scale
-    max_w, max_h = 0, 0
+    # Tight layout constraints
+    spacing_between_label_and_value = 4 * export_scale
+    spacing_between_rows = 28 * export_scale
+    padding_top_bottom = 30 * export_scale
     
     processed_stats = []
     for stat_row in enabled_stats:
@@ -601,51 +608,62 @@ def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
         vx = v_bbox[2] - v_bbox[0]
         vy = v_bbox[3] - v_bbox[1]
         
-        cell_w = max(lx, vx)
-        cell_h = ly + vy + (10 * export_scale) 
-        
-        max_w = max(max_w, cell_w)
-        max_h = max(max_h, cell_h)
-        
-        processed_stats.append((label, value, lx, ly, vx, vy))
+        cell_h = ly + spacing_between_label_and_value + vy
+        processed_stats.append((label, value, lx, ly, vx, vy, cell_h))
 
     cols = min(2, len(enabled_stats))
     rows = math.ceil(len(enabled_stats) / cols)
     
-    cell_box_w = max_w + (pad_x * 2)
-    cell_box_h = max_h + (pad_y * 2)
+    # Calculate perfect variable height
+    total_height = padding_top_bottom * 2
+    row_heights = []
     
-    total_width = cell_box_w * cols
-    total_height = cell_box_h * rows
+    for r in range(rows):
+        idx_start = r * cols
+        idx_end = min((r + 1) * cols, len(enabled_stats))
+        max_h = max([s[6] for s in processed_stats[idx_start:idx_end]])
+        row_heights.append(max_h)
+        total_height += max_h
+        
+    total_height += (rows - 1) * spacing_between_rows
     
-    img = Image.new("RGBA", (total_width, total_height), (0, 0, 0, 0))
+    # Render final canvas
+    img = Image.new("RGBA", (actual_width, total_height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     
-    for i, (label, value, lx, ly, vx, vy) in enumerate(processed_stats):
-        col = i % cols
-        r = i // cols
+    drop_shadow = config["stats_png_drop_shadow"]
+    shadow_offset = max(1 * export_scale, base_font_size * export_scale // 15)
+    shadow_color = (0, 0, 0, 180)
+    
+    current_y = padding_top_bottom
+    
+    for r in range(rows):
+        idx_start = r * cols
+        idx_end = min((r + 1) * cols, len(enabled_stats))
+        row_items = processed_stats[idx_start:idx_end]
         
-        if i == len(enabled_stats) - 1 and len(enabled_stats) % 2 != 0:
-            x0 = (total_width - cell_box_w) // 2
-        else:
-            x0 = col * cell_box_w
+        for i, (label, value, lx, ly, vx, vy, cell_h) in enumerate(row_items):
+            # Centering logic per column
+            if len(row_items) == 1 and cols == 2:
+                center_x = actual_width // 2
+            else:
+                col_width = actual_width // cols
+                center_x = (i * col_width) + (col_width // 2)
+                
+            label_x = center_x - (lx // 2)
+            label_y = current_y
             
-        y0 = r * cell_box_h
-        
-        label_x = x0 + (cell_box_w - lx) // 2
-        label_y = y0 + pad_y
-        
-        val_x = x0 + (cell_box_w - vx) // 2
-        val_y = label_y + ly + (10 * export_scale)
-        
-        if drop_shadow:
-            shadow_offset = max(1 * export_scale, font_size // 15)
-            shadow_color = (0, 0, 0, 180)
-            draw.text((label_x + shadow_offset, label_y + shadow_offset), label, font=label_font, fill=shadow_color)
-            draw.text((val_x + shadow_offset, val_y + shadow_offset), value, font=value_font, fill=shadow_color)
+            val_x = center_x - (vx // 2)
+            val_y = label_y + ly + spacing_between_label_and_value
             
-        draw.text((label_x, label_y), label, font=label_font, fill=(255, 255, 255, 255))
-        draw.text((val_x, val_y), value, font=value_font, fill=(255, 255, 255, 255))
+            if drop_shadow:
+                draw.text((label_x + shadow_offset, label_y + shadow_offset), label, font=label_font, fill=shadow_color)
+                draw.text((val_x + shadow_offset, val_y + shadow_offset), value, font=value_font, fill=shadow_color)
+                
+            draw.text((label_x, label_y), label, font=label_font, fill=(255, 255, 255, 255))
+            draw.text((val_x, val_y), value, font=value_font, fill=(255, 255, 255, 255))
+            
+        current_y += row_heights[r] + spacing_between_rows
         
     buf = io.BytesIO()
     img.save(buf, format="PNG")
