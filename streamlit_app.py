@@ -298,31 +298,44 @@ def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFr
 
 def get_inter_font(weight: str = "Regular", size: int = 12) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """
-    Dynamically downloads and caches the Inter font (used natively by Strava)
-    to ensure crisp, identical typography across all cloud environments.
+    Loads the Inter font from the local 'fonts' directory.
+    Includes comprehensive debug prints to the terminal to trace loading issues.
     """
     font_dir = Path("fonts")
-    font_dir.mkdir(exist_ok=True)
     font_path = font_dir / f"Inter-{weight}.ttf"
     
-    if not font_path.exists():
-        base_url = f"https://raw.githubusercontent.com/rsms/inter/master/docs/font-files/Inter-{weight}.ttf"
+    print(f"[DEBUG FONT] Attempting to load: {font_path.absolute()}")
+    
+    if font_path.exists():
         try:
-            request = urllib.request.Request(base_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=10) as response:
-                font_path.write_bytes(response.read())
+            font = ImageFont.truetype(str(font_path), size=size)
+            print(f"[DEBUG FONT] SUCCESS: Loaded local file {font_path.name} at size {size}")
+            return font
+        except Exception as e:
+            print(f"[DEBUG FONT] ERROR: File exists but failed to load {font_path.name}. Error: {e}")
+    else:
+        print(f"[DEBUG FONT] MISSING: File does not exist at {font_path.absolute()}")
+
+    print("[DEBUG FONT] Falling back to standard system fonts.")
+    candidates = [
+        "DejaVuSans.ttf", 
+        "Arial.ttf", 
+        "LiberationSans-Regular.ttf", 
+        "Helvetica.ttf", 
+        "Roboto-Regular.ttf",
+        "OpenSans-Regular.ttf",
+        "FreeMono.ttf"
+    ]
+    for candidate in candidates:
+        try:
+            font = ImageFont.truetype(candidate, size=size)
+            print(f"[DEBUG FONT] SUCCESS: Loaded fallback font {candidate}")
+            return font
         except Exception:
-            for candidate in ["DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"]:
-                try:
-                    return ImageFont.truetype(candidate, size=size)
-                except Exception:
-                    continue
-            return ImageFont.load_default()
+            continue
             
-    try:
-        return ImageFont.truetype(str(font_path), size=size)
-    except Exception:
-        return ImageFont.load_default()
+    print("[DEBUG FONT] FAILURE: All TTF fallbacks failed. Using PIL default, non-scalable font.")
+    return ImageFont.load_default()
 
 
 def mercator_project(lat: float, lon: float, zoom: int) -> tuple[float, float]:
