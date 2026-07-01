@@ -20,6 +20,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib as mpl
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 from fitparse import FitFile
@@ -446,7 +447,13 @@ def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len:
         cmap_name += "_r"
         
     norm = mcolors.Normalize(vmin=interp_values.min(), vmax=interp_values.max())
-    cmap = cm.get_cmap(cmap_name)
+    
+    # FIX: Use the modern colormaps registry to avoid the get_cmap AttributeError
+    try:
+        cmap = mpl.colormaps[cmap_name]
+    except AttributeError:
+        # Fallback for very old versions of matplotlib
+        cmap = cm.get_cmap(cmap_name)
     
     return [tuple(int(c * 255) for c in cmap(norm(v))[:4]) for v in interp_values]
 
