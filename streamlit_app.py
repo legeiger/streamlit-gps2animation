@@ -297,7 +297,17 @@ def trim_track_points(points: pd.DataFrame, config: dict[str, Any]) -> pd.DataFr
 
 
 def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    for candidate in ["DejaVuSans.ttf", "Arial.ttf", "LiberationSans-Regular.ttf"]:
+    """Robust font fallback to ensure high-resolution text scales correctly on all OS."""
+    candidates = [
+        "DejaVuSans.ttf", 
+        "Arial.ttf", 
+        "LiberationSans-Regular.ttf", 
+        "Helvetica.ttf", 
+        "Roboto-Regular.ttf",
+        "OpenSans-Regular.ttf",
+        "FreeMono.ttf"
+    ]
+    for candidate in candidates:
         try:
             return ImageFont.truetype(candidate, size=size)
         except Exception:
@@ -420,8 +430,12 @@ def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len:
     mode = config.get("color_mode", "Solid Color")
     ramp = config.get("color_ramp", "turbo")
     
+    # We always return alpha as 255 here, because global alpha compositing is 
+    # handled at the image layer in draw_progress to prevent overlapped darker joints.
+    alpha_int = 255
+    
     if mode == "Solid Color":
-        return [to_rgba(config["track_color"])] * target_len
+        return [to_rgba(config["track_color"], alpha_int)] * target_len
         
     metric_mapping = {
         "Elevation": "altitude_m",
@@ -432,11 +446,11 @@ def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len:
     
     metric = metric_mapping.get(mode)
     if metric not in points.columns:
-        return [to_rgba(config["track_color"])] * target_len
+        return [to_rgba(config["track_color"], alpha_int)] * target_len
         
     values = points[metric].fillna(0).to_numpy()
     if len(values) == 0 or values.max() == values.min():
-        return [to_rgba(config["track_color"])] * target_len
+        return [to_rgba(config["track_color"], alpha_int)] * target_len
         
     orig_indices = np.linspace(0, 1, len(values))
     target_indices = np.linspace(0, 1, target_len)
@@ -448,23 +462,30 @@ def get_segment_colors(points: pd.DataFrame, config: dict[str, Any], target_len:
         
     norm = mcolors.Normalize(vmin=interp_values.min(), vmax=interp_values.max())
     
-    # FIX: Use the modern colormaps registry to avoid the get_cmap AttributeError
     try:
         cmap = mpl.colormaps[cmap_name]
     except AttributeError:
-        # Fallback for very old versions of matplotlib
         cmap = cm.get_cmap(cmap_name)
     
-    return [tuple(int(c * 255) for c in cmap(norm(v))[:4]) for v in interp_values]
+    return [tuple(int(c * 255) for c in cmap(norm(v))[:3] + (1.0,)) for v in interp_values]
 
 
 def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, config: dict[str, Any], raw_points: pd.DataFrame) -> None:
-    draw = ImageDraw.Draw(image)
     limit = max(2, int(round((len(points_xy) - 1) * progress)))
     
     mode = config.get("color_mode", "Solid Color")
     width = config["track_width"]
+    alpha_mult = config.get("track_alpha", 1.0)
     
+    # Optimization: To prevent segment-overlap darkening when alpha is used,
+    # we draw solid to an overlay and composite it globally.
+    if alpha_mult >= 0.99:
+        target_img = image
+        draw = ImageDraw.Draw(target_img)
+    else:
+        target_img = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(target_img)
+        
     if mode == "Solid Color":
         track = [tuple(point) for point in points_xy[:limit]]
         if len(track) > 1:
@@ -475,6 +496,13 @@ def draw_progress(image: Image.Image, points_xy: np.ndarray, progress: float, co
             p1 = tuple(points_xy[i])
             p2 = tuple(points_xy[i+1])
             draw.line([p1, p2], fill=colors[i], width=width, joint="curve")
+            
+    # Composite overlay if necessary
+    if alpha_mult < 0.99:
+        alpha_channel = target_img.split()[3]
+        alpha_channel = alpha_channel.point(lambda p: int(p * alpha_mult))
+        target_img.putalpha(alpha_channel)
+        image.alpha_composite(target_img)
 
 
 def render_frame(points: pd.DataFrame, config: dict[str, Any], progress: float) -> Image.Image:
@@ -538,22 +566,25 @@ def render_bundle(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any
 
 
 def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
-    """Renders the stats UI dynamically adapting bounding boxes to fix cloud layout drift."""
+    """Renders the stats UI dynamically, scaled 3x for a crystal-clear high-definition PNG export."""
     enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
     
     if not enabled_stats:
         return b""
         
-    font_size = config["stats_font_size"]
+    # Super-sampling scale multiplier
+    export_scale = 3 
+    
+    font_size = config["stats_font_size"] * export_scale
     drop_shadow = config["stats_png_drop_shadow"]
     
-    value_font = get_font(font_size + 12)
-    label_font = get_font(max(12, font_size - 4))
+    value_font = get_font(font_size + (12 * export_scale))
+    label_font = get_font(max(12 * export_scale, font_size - (4 * export_scale)))
     
     dummy_img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
     draw = ImageDraw.Draw(dummy_img)
     
-    pad_x, pad_y = 40, 30
+    pad_x, pad_y = 40 * export_scale, 30 * export_scale
     max_w, max_h = 0, 0
     
     processed_stats = []
@@ -571,7 +602,7 @@ def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
         vy = v_bbox[3] - v_bbox[1]
         
         cell_w = max(lx, vx)
-        cell_h = ly + vy + 10 
+        cell_h = ly + vy + (10 * export_scale) 
         
         max_w = max(max_w, cell_w)
         max_h = max(max_h, cell_h)
@@ -605,10 +636,10 @@ def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
         label_y = y0 + pad_y
         
         val_x = x0 + (cell_box_w - vx) // 2
-        val_y = label_y + ly + 10
+        val_y = label_y + ly + (10 * export_scale)
         
         if drop_shadow:
-            shadow_offset = max(1, font_size // 15)
+            shadow_offset = max(1 * export_scale, font_size // 15)
             shadow_color = (0, 0, 0, 180)
             draw.text((label_x + shadow_offset, label_y + shadow_offset), label, font=label_font, fill=shadow_color)
             draw.text((val_x + shadow_offset, val_y + shadow_offset), value, font=value_font, fill=shadow_color)
@@ -1004,6 +1035,8 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
         invert_color_ramp = st.sidebar.toggle("Invert color ramp", value=False)
         
     track_width = st.sidebar.number_input("Track width", min_value=1, max_value=40, value=9, step=1)
+    track_alpha = st.sidebar.slider("Track opacity", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+    
     fps = st.sidebar.number_input("Animation FPS", min_value=1, max_value=60, value=DEFAULT_FPS, step=1)
     duration_seconds = st.sidebar.number_input("Total duration (seconds)", min_value=1, max_value=60, value=DEFAULT_DURATION_SECONDS, step=1)
     speed_multiplier = st.sidebar.number_input("Animation speed", min_value=1, max_value=6, value=DEFAULT_SPEED_MULTIPLIER, step=1)
@@ -1052,6 +1085,7 @@ def sidebar_controls(bundle: ActivityBundle) -> dict[str, Any]:
         "color_ramp": color_ramp,
         "invert_color_ramp": invert_color_ramp,
         "track_width": track_width,
+        "track_alpha": track_alpha,
         "fps": fps,
         "duration_seconds": duration_seconds,
         "speed_multiplier": speed_multiplier,
@@ -1216,7 +1250,7 @@ def export_panel(bundle: ActivityBundle, config: dict[str, Any], rendered: dict[
         
         st.divider()
         st.markdown("### Export Stats Overlay")
-        st.caption("PNG with selected stats from the sidebar table.")
+        st.caption("High-res 3x PNG with selected stats from the sidebar table.")
         if stats_png_bytes:
             st.download_button(
                 "Download Stats PNG", 
