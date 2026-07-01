@@ -41,7 +41,7 @@ DEFAULT_BACKGROUND = (0, 0, 0, 0)
 DEFAULT_FPS = 30
 DEFAULT_DURATION_SECONDS = 5
 DEFAULT_SPEED_MULTIPLIER = 3
-DEFAULT_STAT_FONT_SIZE = 30
+DEFAULT_STAT_FONT_SIZE = 24
 GARMIN_TOKEN_DIR = Path("data") / "garminconnect"
 
 CANVAS_OPTIONS = {
@@ -581,20 +581,20 @@ def render_bundle(points: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any
 
 
 def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
-    """Renders the stats UI dynamically, scaled 3x for high-definition with tight 400px variable-height layout."""
+    """Renders the stats UI dynamically, scaled 2x for high-definition with tight 400px variable-height layout."""
     enabled_stats = [row for row in config["stats_rows"] if row.get("enabled")]
     
     if not enabled_stats:
         return b""
         
-    export_scale = 3 
+    export_scale = 2
     base_width = 400
     actual_width = base_width * export_scale
     
     # Scale fonts relative to user setting
     base_font_size = config["stats_font_size"]
-    label_size = max(10, base_font_size - 4) * export_scale
-    value_size = (base_font_size + 4) * export_scale
+    label_size = max(10, base_font_size - 6) * export_scale
+    value_size = (base_font_size + 2) * export_scale
     
     label_font = get_inter_font("Regular", label_size)
     value_font = get_inter_font("Bold", value_size)
@@ -603,9 +603,9 @@ def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
     draw = ImageDraw.Draw(dummy_img)
     
     # Tight layout constraints
-    spacing_between_label_and_value = 4 * export_scale
-    spacing_between_rows = 28 * export_scale
-    padding_top_bottom = 30 * export_scale
+    spacing_between_label_and_value = 6 * export_scale
+    spacing_between_rows = 34 * export_scale
+    padding_top_bottom = 26 * export_scale
     
     processed_stats = []
     for stat_row in enabled_stats:
@@ -645,7 +645,7 @@ def render_stats_png(bundle: ActivityBundle, config: dict[str, Any]) -> bytes:
     draw = ImageDraw.Draw(img)
     
     drop_shadow = config["stats_png_drop_shadow"]
-    shadow_offset = max(1 * export_scale, base_font_size * export_scale // 15)
+    shadow_offset = max(1 * export_scale, base_font_size * export_scale // 16)
     shadow_color = (0, 0, 0, 180)
     
     current_y = padding_top_bottom
@@ -1140,7 +1140,7 @@ def bundle_overview(bundle: ActivityBundle, config: dict[str, Any]) -> None:
     st.markdown("<div style='text-align:center; font-size:1.1rem; font-weight:700; letter-spacing:0.02em; margin: 0.25rem 0 0.85rem;'>Stats</div>", unsafe_allow_html=True)
     
     cols = st.columns(2)
-    label_font_size = max(10, config["stats_font_size"] - 8)
+    label_font_size = max(10, config["stats_font_size"] - 6)
     card_html = """
     <div style="padding: 1rem 1.1rem; border-radius: 18px; border: 1px solid rgba(255,255,255,0.08); background: rgba(13,17,22,0.72); box-shadow: 0 14px 34px rgba(0,0,0,0.18); text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height: 112px; margin-bottom: 1rem;">
       <div style="font-size: {label_font_size}px; line-height: 1.1; letter-spacing: 0.02em; color: rgba(245,247,250,0.72); margin-bottom: 0.45rem;">{label}</div>
